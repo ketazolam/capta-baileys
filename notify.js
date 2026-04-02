@@ -1,11 +1,11 @@
 import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-const CAPTA_WEBHOOK = process.env.CAPTA_APP_URL
+const CAPTA_WEBHOOK = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
 
 export async function notifyCapta(lineId, event, data) {
   try {
@@ -54,9 +54,11 @@ export async function notifyCapta(lineId, event, data) {
 
         // Update contact totals
         if (data.amount && contact) {
+          const currentTotal = Number(contact.total_purchases) || 0
+          const currentCount = Number(contact.purchase_count) || 0
           await supabase.from('contacts').update({
-            total_purchases: supabase.rpc('increment', { x: data.amount }),
-            purchase_count: supabase.rpc('increment', { x: 1 }),
+            total_purchases: currentTotal + Number(data.amount),
+            purchase_count: currentCount + 1,
             last_seen_at: new Date().toISOString(),
           }).eq('id', contact.id)
         }
