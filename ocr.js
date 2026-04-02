@@ -1,12 +1,13 @@
 import OpenAI from 'openai'
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+let openai = null
 
 export async function processComprobante(base64Image, mimetype = 'image/jpeg') {
   if (!process.env.OPENAI_API_KEY) {
     console.warn('[OCR] No OPENAI_API_KEY set, skipping comprobante processing')
     return null
   }
+  if (!openai) openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
   try {
     const response = await openai.chat.completions.create({
