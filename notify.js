@@ -76,21 +76,22 @@ export async function notifyCapta(lineId, event, data) {
         break
       }
 
-      case 'message':
+      case 'message': {
         // Update last_seen on contact
-        const { data: line } = await supabase
+        const { data: msgLine } = await supabase
           .from('lines')
           .select('project_id')
           .eq('id', lineId)
           .single()
-        if (line) {
+        if (msgLine) {
           await supabase.from('contacts').upsert({
-            project_id: line.project_id,
+            project_id: msgLine.project_id,
             phone: data.phone,
             last_seen_at: new Date().toISOString(),
           }, { onConflict: 'project_id,phone' })
         }
         break
+      }
     }
   } catch (err) {
     console.error(`[notify] ${event}:`, err.message)
