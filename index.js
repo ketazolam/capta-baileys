@@ -19,6 +19,31 @@ app.use('/lines', (req, res, next) => {
   next()
 })
 
+// POST /send — send a WhatsApp message via a connected session
+app.post('/send', (req, res, next) => {
+  const secret = process.env.INTERNAL_SECRET
+  if (secret && req.headers['x-internal-secret'] !== secret) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  next()
+}, async (req, res) => {
+  const { lineId, to, text } = req.body
+  if (!lineId || !to || !text) {
+    return res.status(400).json({ error: 'lineId, to, and text are required' })
+  }
+  const session = sessionManager.get(lineId)
+  if (!session?.socket || session.status !== 'connected') {
+    return res.status(400).json({ error: 'Session not connected' })
+  }
+  try {
+    const jid = to.replace(/\D/g, '') + '@s.whatsapp.net'
+    await session.socket.sendMessage(jid, { text })
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 app.use('/lines', linesRouter)
 
 const PORT = process.env.PORT || 3001
