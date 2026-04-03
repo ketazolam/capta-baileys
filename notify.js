@@ -22,9 +22,9 @@ export async function notifyCapta(lineId, event, data) {
         break
 
       case 'disconnected':
+        // Keep phone_number so we can still identify the line — only clear status
         await supabase.from('lines').update({
           status: 'disconnected',
-          phone_number: null,
         }).eq('id', lineId)
         break
 
