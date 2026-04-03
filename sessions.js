@@ -106,20 +106,22 @@ async function startSession(lineId) {
 
 async function handleMessage(lineId, sock, msg) {
   const from = msg.key.remoteJid
-  const phone = from?.replace('@s.whatsapp.net', '').replace('@g.us', '')
+  const phone = from?.replace('@s.whatsapp.net', '').replace('@g.us', '').replace('@lid', '')
   const content = msg.message
 
-  // Check for image (comprobante) — delegate analysis to Capta
+  // Check for image (comprobante) — handles both imageMessage and documentMessage with image mimetype
   const imageMsg = content?.imageMessage
-  if (imageMsg) {
-    console.log(`[${lineId}] Image received from ${phone} — sending to Capta`)
+  const docMsg = content?.documentMessage
+  const imageMediaMsg = imageMsg || (docMsg?.mimetype?.startsWith('image/') ? docMsg : null)
+  if (imageMediaMsg) {
+    console.log(`[${lineId}] Image received from ${phone} (${imageMediaMsg === docMsg ? 'document' : 'photo'}) — sending to Capta`)
     try {
       const buffer = await sock.downloadMediaMessage(msg, 'buffer')
       const base64 = buffer.toString('base64')
       await notifyCapta(lineId, 'comprobante', {
         phone,
         imageBase64: base64,
-        mimetype: imageMsg.mimetype || 'image/jpeg',
+        mimetype: imageMediaMsg.mimetype || 'image/jpeg',
       })
     } catch (err) {
       console.error(`[${lineId}] Error sending comprobante:`, err.message)

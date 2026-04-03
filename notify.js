@@ -10,6 +10,10 @@ const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
 export async function notifyCapta(lineId, event, data) {
   try {
     switch (event) {
+      case 'qr_ready':
+        await supabase.from('lines').update({ status: 'qr_pending' }).eq('id', lineId)
+        break
+
       case 'connected':
         await supabase.from('lines').update({
           status: 'connected',

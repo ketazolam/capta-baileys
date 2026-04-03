@@ -26,7 +26,7 @@ router.get('/:lineId/qr', async (req, res) => {
   const session = sessionManager.get(lineId)
 
   if (!session) return res.status(404).json({ error: 'Session not found' })
-  if (!session.qr) return res.status(204).json({ status: session.status, qr: null })
+  if (!session.qr) return res.status(200).json({ status: session.status, qr: null })
 
   try {
     const qrDataUrl = await QRCode.toDataURL(session.qr, { width: 300, margin: 2 })
