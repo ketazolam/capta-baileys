@@ -54,7 +54,7 @@ async function startSession(lineId) {
     version,
     auth: state,
     printQRInTerminal: false,
-    logger: { level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: console.warn, error: console.error, fatal: console.error, child: () => ({}) },
+    logger: (() => { const l = { level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {} }; l.child = () => l; return l })(),
   })
 
   sessionData.socket = sock
