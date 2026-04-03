@@ -7,6 +7,20 @@ const supabase = createClient(
 
 const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
 
+async function sendTelegram(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN
+  const chatId = process.env.TELEGRAM_CHAT_ID
+  if (!token || !chatId) return
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
+      signal: AbortSignal.timeout(5000),
+    })
+  } catch {}
+}
+
 export async function notifyCapta(lineId, event, data) {
   try {
     switch (event) {
@@ -21,12 +35,21 @@ export async function notifyCapta(lineId, event, data) {
         }).eq('id', lineId)
         break
 
-      case 'disconnected':
+      case 'disconnected': {
         // Keep phone_number so we can still identify the line — only clear status
-        await supabase.from('lines').update({
-          status: 'disconnected',
-        }).eq('id', lineId)
+        const { data: discLine } = await supabase
+          .from('lines')
+          .select('name, phone_number, projects(name)')
+          .eq('id', lineId)
+          .single()
+        await supabase.from('lines').update({ status: 'disconnected' }).eq('id', lineId)
+        const lineName = discLine?.name || lineId
+        const linePhone = discLine?.phone_number ? ` (+${discLine.phone_number})` : ''
+        const projectName = discLine?.projects?.name ? ` — proyecto <b>${discLine.projects.name}</b>` : ''
+        const reason = data?.reason ? ` (código ${data.reason})` : ''
+        await sendTelegram(`⚠️ <b>Línea desconectada${projectName}</b>\n📱 ${lineName}${linePhone}${reason}\n\nReconectá en: ${CAPTA_URL}`)
         break
+      }
 
       case 'comprobante': {
         const { data: line } = await supabase
