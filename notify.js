@@ -52,16 +52,8 @@ export async function notifyCapta(lineId, event, data) {
           status: 'pending',
         }).select().single()
 
-        // Update contact totals
-        if (data.amount && contact) {
-          const currentTotal = Number(contact.total_purchases) || 0
-          const currentCount = Number(contact.purchase_count) || 0
-          await supabase.from('contacts').update({
-            total_purchases: currentTotal + Number(data.amount),
-            purchase_count: currentCount + 1,
-            last_seen_at: new Date().toISOString(),
-          }).eq('id', contact.id)
-        }
+        // Note: contact totals updated atomically via increment_contact_purchase RPC
+        // inside /api/webhook/sale — do NOT update here to avoid double-counting
 
         // Notify Capta app via webhook to send Meta CAPI Purchase event
         if (CAPTA_WEBHOOK && sale) {
