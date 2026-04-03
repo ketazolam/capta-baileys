@@ -9,6 +9,9 @@ import path from 'path'
 import fs from 'fs'
 import { notifyCapta } from './notify.js'
 
+const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
+const recentContacts = new Map()
+
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions_data'
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true })
 
@@ -134,5 +137,12 @@ async function handleMessage(lineId, sock, msg) {
   const text = content?.conversation || content?.extendedTextMessage?.text
   if (text) {
     await notifyCapta(lineId, 'message', { phone, text })
+
+    const contactKey = `${lineId}:${phone}`
+    const lastNotified = recentContacts.get(contactKey) || 0
+    if (Date.now() - lastNotified > TWENTY_FOUR_HOURS) {
+      recentContacts.set(contactKey, Date.now())
+      await notifyCapta(lineId, 'conversation_start', { phone, text })
+    }
   }
 }

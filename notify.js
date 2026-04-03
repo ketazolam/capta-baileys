@@ -80,6 +80,29 @@ export async function notifyCapta(lineId, event, data) {
         break
       }
 
+      case 'conversation_start': {
+        const { data: csLine } = await supabase
+          .from('lines')
+          .select('project_id')
+          .eq('id', lineId)
+          .single()
+        if (csLine) {
+          await fetch(`${CAPTA_URL}/api/webhook/conversation`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-internal-secret': process.env.INTERNAL_SECRET || '',
+            },
+            body: JSON.stringify({
+              project_id: csLine.project_id,
+              phone: data.phone,
+              line_id: lineId,
+            }),
+          }).catch(err => console.error('[notify] conversation_start error:', err.message))
+        }
+        break
+      }
+
       case 'message': {
         // Update last_seen on contact
         const { data: msgLine } = await supabase
