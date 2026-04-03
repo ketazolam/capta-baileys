@@ -44,7 +44,9 @@ Si no es un comprobante de pago, respondé: {"amount": null, "reference": null, 
     const text = response.choices[0]?.message?.content?.trim()
     if (!text) return null
 
-    const parsed = JSON.parse(text)
+    // Strip markdown code fences if GPT wraps JSON in ```json ... ```
+    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim()
+    const parsed = JSON.parse(cleaned)
     if (!parsed.amount && !parsed.reference) return null
     return parsed
   } catch (err) {
