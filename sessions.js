@@ -7,7 +7,6 @@ import { Boom } from '@hapi/boom'
 import path from 'path'
 import fs from 'fs'
 import { notifyCapta } from './notify.js'
-import { processComprobante } from './ocr.js'
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions_data'
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true })
@@ -36,7 +35,6 @@ export const sessionManager = {
       try { await session.socket.logout() } catch {}
     }
     sessions.delete(lineId)
-    // Clean session files
     const sessionPath = path.join(SESSIONS_DIR, lineId)
     if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true })
   },
@@ -68,7 +66,6 @@ async function startSession(lineId) {
       sessionData.qr = qr
       sessionData.status = 'waiting_qr'
       console.log(`[${lineId}] QR ready`)
-      // Notify Capta that QR is ready
       await notifyCapta(lineId, 'qr_ready', { qr })
     }
 
@@ -112,26 +109,20 @@ async function handleMessage(lineId, sock, msg) {
   const phone = from?.replace('@s.whatsapp.net', '').replace('@g.us', '')
   const content = msg.message
 
-  // Check for image (comprobante)
+  // Check for image (comprobante) — delegate analysis to Capta
   const imageMsg = content?.imageMessage
   if (imageMsg) {
-    console.log(`[${lineId}] Image received from ${phone} — processing comprobante`)
+    console.log(`[${lineId}] Image received from ${phone} — sending to Capta`)
     try {
       const buffer = await sock.downloadMediaMessage(msg, 'buffer')
       const base64 = buffer.toString('base64')
-      const result = await processComprobante(base64, imageMsg.mimetype || 'image/jpeg')
-      if (result) {
-        await notifyCapta(lineId, 'comprobante', {
-          phone,
-          amount: result.amount,
-          reference: result.reference,
-          concept: result.concept,
-          imageBase64: base64,
-          mimetype: imageMsg.mimetype,
-        })
-      }
+      await notifyCapta(lineId, 'comprobante', {
+        phone,
+        imageBase64: base64,
+        mimetype: imageMsg.mimetype || 'image/jpeg',
+      })
     } catch (err) {
-      console.error(`[${lineId}] Error processing comprobante:`, err.message)
+      console.error(`[${lineId}] Error sending comprobante:`, err.message)
     }
     return
   }
