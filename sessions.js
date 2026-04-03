@@ -2,6 +2,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import path from 'path'
@@ -116,7 +117,7 @@ async function handleMessage(lineId, sock, msg) {
   if (imageMediaMsg) {
     console.log(`[${lineId}] Image received from ${phone} (${imageMediaMsg === docMsg ? 'document' : 'photo'}) — sending to Capta`)
     try {
-      const buffer = await sock.downloadMediaMessage(msg, 'buffer')
+      const buffer = await downloadMediaMessage(msg, 'buffer', {}, { reuploadRequest: sock.updateMediaMessage })
       const base64 = buffer.toString('base64')
       await notifyCapta(lineId, 'comprobante', {
         phone,
