@@ -116,10 +116,15 @@ app.listen(PORT, async () => {
 
     if (lines?.length) {
       console.log(`[Capta Baileys] Auto-reconnecting ${lines.length} active line(s)...`)
-      for (const line of lines) {
-        sessionManager.create(line.id).catch(err =>
-          console.error(`[Capta Baileys] Failed to reconnect line ${line.name}:`, err.message)
-        )
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]
+        // Stagger reconnections — simultaneous connects from same server = datacenter pattern
+        const staggerDelay = i * (15000 + Math.random() * 30000) // 15-45s between each line
+        setTimeout(() => {
+          sessionManager.create(line.id).catch(err =>
+            console.error(`[Capta Baileys] Failed to reconnect line ${line.name}:`, err.message)
+          )
+        }, staggerDelay)
       }
     }
   } catch (err) {

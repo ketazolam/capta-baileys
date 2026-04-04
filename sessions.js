@@ -15,9 +15,19 @@ import { notifyCapta, sendTelegramAlert } from './notify.js'
 // Residential proxy — routes WhatsApp WebSocket through residential IP
 // Set PROXY_URL env var: http://user:pass@host:port
 const PROXY_URL = process.env.PROXY_URL || null
-function createProxyAgent() {
+function createProxyAgent(lineId, reconnectAttempt = 0) {
   if (!PROXY_URL) return undefined
-  return new HttpsProxyAgent(PROXY_URL)
+  try {
+    const url = new URL(PROXY_URL)
+    // IPRoyal: append session ID + lifetime for per-session sticky IP isolation
+    // Each line gets its own residential IP; reconnects rotate to a fresh one
+    const sessionId = lineId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)
+    const rotationSuffix = reconnectAttempt > 0 ? `r${reconnectAttempt}` : ''
+    url.username = `${url.username}_session-${sessionId}${rotationSuffix}_lifetime-60m`
+    return new HttpsProxyAgent(url.toString())
+  } catch {
+    return new HttpsProxyAgent(PROXY_URL)
+  }
 }
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
@@ -179,9 +189,10 @@ async function startSession(lineId) {
   }
   sessions.set(lineId, sessionData)
 
-  // Create proxy agent per session (each session gets its own agent instance)
-  const proxyAgent = createProxyAgent()
-  if (proxyAgent) console.log(`[${lineId}] Using residential proxy: ${PROXY_URL.replace(/\/\/.*@/, '//***@')}`)
+  // Create proxy agent per session — each line gets its own sticky residential IP
+  const reconnectAttempt = sessions.get(lineId)?.reconnectAttempts || 0
+  const proxyAgent = createProxyAgent(lineId, reconnectAttempt)
+  if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttempt > 0 ? `/r${reconnectAttempt}` : ''})`)
 
   const sock = makeWASocket({
     version,
@@ -189,8 +200,10 @@ async function startSession(lineId) {
     // --- Residential proxy: route WebSocket + fetches through residential IP ---
     agent: proxyAgent,
     fetchAgent: proxyAgent,
-    // Anti-fingerprint: identify as real WhatsApp Web client, not Baileys
-    browser: Browsers.ubuntu('Chrome'),
+    // Anti-fingerprint: Windows + Chrome is the most common combo in Argentina
+    browser: Browsers.windows('Chrome'),
+    // Locale must match phone number country (+54) and proxy geolocation (AR)
+    countryCode: 'AR',
     // Don't mark online immediately — avoids automated "always online" pattern
     markOnlineOnConnect: false,
     // Don't generate link previews — reduces server-side API calls
@@ -204,6 +217,13 @@ async function startSession(lineId) {
     shouldIgnoreJid: (jid) =>        // Skip system/broadcast JIDs at socket level
       jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@lid'),
     getMessage: async () => undefined,
+    // WebSocket upgrade headers — match a real Chrome browser in Argentina
+    options: {
+      headers: {
+        'Accept-Language': 'es-AR,es;q=0.9,en;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+    },
     logger: (() => { const l = { level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {} }; l.child = () => l; return l })(),
   })
 
@@ -339,11 +359,27 @@ async function startSession(lineId) {
     }
   }, (3 + Math.random() * 3) * 60 * 60 * 1000) // Every 3-6 hours
 
+  // --- Self-chat outbound seeding: add outbound traffic to look like a real user ---
+  // A number that only receives and never sends is statistically anomalous.
+  // Send to self-chat (own JID) — completely safe, no external recipient.
+  const selfChatMessages = ['\u{1f4cc}', '\u{2705}', '\u{1f44d}', '\u{1f517}', 'ok', '..', 'listo', 'ver']
+  const selfChatInterval = setInterval(async () => {
+    if (sessionData.status !== 'connected' || !isActiveTime()) return
+    if (Math.random() > 0.15) return // ~15% chance per 2h cycle = ~2-3 per day
+    if (!sessionData.phone) return
+    try {
+      const selfJid = `${sessionData.phone}@s.whatsapp.net`
+      const selfMsg = selfChatMessages[Math.floor(Math.random() * selfChatMessages.length)]
+      await sock.sendMessage(selfJid, { text: selfMsg })
+    } catch {}
+  }, 2 * 60 * 60 * 1000) // Check every 2 hours
+
   // Clean up intervals on disconnect
   sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'close') {
       clearInterval(presenceInterval)
       clearInterval(connectionDropInterval)
+      clearInterval(selfChatInterval)
     }
   })
 
@@ -410,6 +446,23 @@ async function handleMessage(lineId, sock, msg) {
     } catch (err) {
       console.error(`[${lineId}] Error sending comprobante:`, err.message)
     }
+    return
+  }
+
+  // --- Silent media download: mimic real WhatsApp Web behavior ---
+  // Real clients auto-download media. Download + discard to match server-side patterns.
+  const otherMedia = content?.audioMessage || content?.videoMessage ||
+                     content?.stickerMessage || content?.documentMessage
+  if (otherMedia) {
+    if (Math.random() < 0.8) { // 80% download, 20% skip (human sometimes ignores)
+      const dlDelay = 2000 + Math.random() * 13000 // 2-15s delay
+      setTimeout(async () => {
+        try {
+          await downloadMediaMessage(msg, 'buffer', {}, { reuploadRequest: sock.updateMediaMessage })
+        } catch {} // Silent fail — non-critical
+      }, dlDelay)
+    }
+    // Don't process further — no text to handle
     return
   }
 
