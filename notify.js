@@ -7,6 +7,10 @@ const supabase = createClient(
 
 const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
 
+// Throttle: max 1 disconnect alert per line every 5 minutes (avoids spam on micro-cuts)
+const disconnectAlertThrottle = new Map()
+const THROTTLE_MS = 5 * 60 * 1000
+
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN
   const chatId = process.env.TELEGRAM_CHAT_ID
@@ -36,18 +40,28 @@ export async function notifyCapta(lineId, event, data) {
         break
 
       case 'disconnected': {
-        // Keep phone_number so we can still identify the line — only clear status
+        await supabase.from('lines').update({ status: 'disconnected' }).eq('id', lineId)
+
+        // Throttle: skip if we already alerted for this line in the last 5 min
+        const lastAlert = disconnectAlertThrottle.get(lineId) || 0
+        if (Date.now() - lastAlert < THROTTLE_MS) break
+        disconnectAlertThrottle.set(lineId, Date.now())
+
         const { data: discLine } = await supabase
           .from('lines')
           .select('name, phone_number, projects(name)')
           .eq('id', lineId)
           .single()
-        await supabase.from('lines').update({ status: 'disconnected' }).eq('id', lineId)
+
         const lineName = discLine?.name || lineId
         const linePhone = discLine?.phone_number ? ` (+${discLine.phone_number})` : ''
         const projectName = discLine?.projects?.name ? ` — proyecto <b>${discLine.projects.name}</b>` : ''
-        const reason = data?.reason ? ` (código ${data.reason})` : ''
-        await sendTelegram(`⚠️ <b>Línea desconectada${projectName}</b>\n📱 ${lineName}${linePhone}${reason}\n\nReconectá en: ${CAPTA_URL}`)
+        // reason 401 = logged out (permanent), otherwise auto-reconnecting
+        const isPermanent = data?.reason === 401
+        const statusNote = isPermanent
+          ? '\n🔴 Sesión cerrada — requiere escanear QR nuevamente.'
+          : '\n🔄 Intentando reconectar automáticamente...'
+        await sendTelegram(`⚠️ <b>Línea desconectada${projectName}</b>\n📱 ${lineName}${linePhone}${statusNote}\n\nReconectá en: ${CAPTA_URL}`)
         break
       }
 
