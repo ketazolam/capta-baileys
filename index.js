@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager, getWarmUpDay } from './sessions.js'
+import { sessionManager, getWarmUpDay, scheduler } from './sessions.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -36,6 +36,11 @@ app.post('/send', (req, res, next) => {
     return res.status(400).json({ error: 'Session not connected' })
   }
   try {
+    // Block sends outside active hours (anti-ban: no 3 AM messages)
+    if (!scheduler.isActiveTime()) {
+      return res.status(429).json({ error: 'Outside active hours (8-23h). Message queued behavior not available yet.' })
+    }
+
     const jid = to.replace(/\D/g, '') + '@s.whatsapp.net'
 
     // Apply anti-ban checks before sending

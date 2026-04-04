@@ -6,7 +6,7 @@ import makeWASocket, {
   Browsers,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
-import { AntiBan } from 'baileys-antiban'
+import { AntiBan, ContentVariator, Scheduler } from 'baileys-antiban'
 import path from 'path'
 import fs from 'fs'
 import { notifyCapta, sendTelegramAlert } from './notify.js'
@@ -20,6 +20,23 @@ if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true }
 
 // Map of lineId -> { socket, qr, status, phone, antiban, reconnectAttempts }
 const sessions = new Map()
+
+// Content variator: makes each message technically unique (zero-width chars, punctuation)
+const variator = new ContentVariator({
+  zeroWidthChars: true,
+  punctuationVariation: true,
+  emojiPadding: false,
+  synonyms: false, // don't replace Spanish words with English synonyms
+})
+
+// Scheduler: only send during realistic hours (Argentina timezone)
+export const scheduler = new Scheduler({
+  activeHours: [8, 23],     // 8 AM to 11 PM
+  peakHours: [10, 21],      // Faster during 10-21h
+  weekendFactor: 0.7,       // 30% less on weekends
+  lunchBreak: [13, 14],     // Slow down at lunch
+  lunchFactor: 0.5,
+})
 
 // --- Cleanup recentContacts every hour (prevent unbounded memory growth) ---
 setInterval(() => {
@@ -57,11 +74,22 @@ export const sessionManager = {
   },
 }
 
-// --- Pitch templates with leet speak (3 variants, rotated randomly) ---
+// --- Pitch templates (7 variants with varied structures) ---
 const PITCH_TEMPLATES = [
+  // Full pitch — leet speak variant A
   `Soy Roma❤️\nTengo para ofrecerte las dos mejores opciones del mercado!\n\nGanamos 🔮(La más buscada)\nZeus ⚡ (Original)\n\n💰Mínimo de c4rg4 $2000\n💰Mínimo de R3T1R0 $4000\n🎁 C4rgando te REGALAMOS un B0N0 de 40% 🤑💰🎁\n\nAtención personalizada las 24hs 💬\n\nDecime tu nombre o apodo y te creó tu USU4RI0`,
+  // Full pitch — leet speak variant B
   `Hola! Soy Roma 💜\nTe cuento las opciones que tenemos!\n\nGanamos 🔮 (La favorita)\nZeus ⚡ (La clásica)\n\n💰 C4rga mínima: $2000\n💰 R3tir0 mínimo: $4000\n🎁 B0nus del 40% en tu primera c4rga 🤑\n\nEstoy 24/7 para ayudarte 💬\n\nPasame tu nombre y te armo el USU4RI0`,
+  // Full pitch — leet speak variant C
   `Roma acá! ❤️\nMirá lo que tengo para vos:\n\nGanamos 🔮 (Top 1)\nZeus ⚡ (Original)\n\n💰 Mín. c4rg4: $2000\n💰 Mín. R3T1R0: $4000\n🎁 40% de B0N0 en la 1ra c4rga 💰🎁\n\n24hs online ✅\n\nDecime un nombre para crear tu USU4RI0`,
+  // Short pitch — casual (for warm-up day 3-4)
+  `Soy Roma 💕\nTenemos dos plataformas increíbles:\n🔮 Ganamos\n⚡ Zeus\n\nSi te interesa pasame tu nombre y te armo todo!`,
+  // Question-style — engages conversation
+  `Hola! Soy Roma ✨\nEstás buscando una plataforma para jugar?\n\nTenemos Ganamos 🔮 y Zeus ⚡\nAmbas con b0nus de bienvenida 🎁\n\nQuerés que te cuente más?`,
+  // Short + emojis different set
+  `Roma! 🙋‍♀️\nTe presento nuestras opciones:\n\n🎰 Ganamos — la más popular\n⚡ Zeus — la original\n\n🎁 Primer c4rg4 con 40% extra\n📲 Pasame un nombre y arrancamos`,
+  // Ultra short — for high-volume days
+  `Hola! Soy Roma 🤗\nTenemos las mejores plataformas con b0nus de bienvenida\nDecime tu nombre y te creo el acceso 🔑`,
 ]
 
 const GREETINGS = [
@@ -185,6 +213,14 @@ async function startSession(lineId) {
     // Don't generate link previews — reduces server-side API calls
     generateHighQualityLinkPreview: false,
     printQRInTerminal: false,
+    // --- Anti-detection tuning ---
+    emitOwnEvents: false,           // Don't fire events for own messages (reduces noise)
+    fireInitQueries: false,          // Don't query app state on connect (bots do this, humans don't)
+    retryRequestDelayMs: 500,        // Slower retries (default 250ms is too fast/bot-like)
+    maxMsgRetryCount: 3,             // Fewer retries (default 5 is aggressive)
+    shouldIgnoreJid: (jid) =>        // Skip system/broadcast JIDs at socket level
+      jid === 'status@broadcast' || jid.endsWith('@newsletter') || jid.endsWith('@lid'),
+    getMessage: async () => undefined,
     logger: (() => { const l = { level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {} }; l.child = () => l; return l })(),
   })
 
@@ -271,15 +307,19 @@ async function startSession(lineId) {
   // --- Simulate human presence: go online/offline periodically ---
   const presenceInterval = setInterval(async () => {
     if (sessionData.status !== 'connected') return
+    // Skip if outside active hours
+    if (!scheduler.isActiveTime()) return
+    // 30% chance: skip this cycle entirely (humans aren't always consistent)
+    if (Math.random() < 0.3) return
     try {
       await sock.sendPresenceUpdate('available')
-      // Stay online for 30s–2min, then go offline
-      const onlineDuration = 30000 + Math.random() * 90000
+      // Stay online for 20s–5min, then go offline
+      const onlineDuration = 20000 + Math.random() * 280000
       setTimeout(async () => {
         try { await sock.sendPresenceUpdate('unavailable') } catch {}
       }, onlineDuration)
     } catch {}
-  }, (10 + Math.random() * 20) * 60 * 1000) // Every 10-30 min
+  }, (15 + Math.random() * 45) * 60 * 1000) // Every 15-60 min
 
   // Clean up presence interval on disconnect
   sock.ev.on('connection.update', ({ connection }) => {
@@ -297,8 +337,11 @@ async function handleMessage(lineId, sock, antiban, msg) {
     return
   }
 
-  // --- Filter: skip automated/bot messages (protocol messages, reactions, polls) ---
-  if (msg.message?.protocolMessage || msg.message?.reactionMessage || msg.message?.pollCreationMessage || msg.message?.pollUpdateMessage) {
+  // --- Filter: skip automated/bot/system messages ---
+  if (msg.message?.protocolMessage || msg.message?.reactionMessage ||
+      msg.message?.pollCreationMessage || msg.message?.pollUpdateMessage ||
+      msg.message?.callMessage || msg.message?.groupInviteMessage ||
+      msg.message?.requestPhoneNumberMessage) {
     return
   }
 
@@ -346,6 +389,11 @@ async function handleMessage(lineId, sock, antiban, msg) {
       await notifyCapta(lineId, 'conversation_start', { phone, text })
 
       // Auto-reply: greeting + pitch (like Convertix)
+      // Skip auto-reply outside active hours
+      if (!scheduler.isActiveTime()) {
+        console.log(`[${lineId}] Outside active hours, skipping auto-reply to ${phone}`)
+        return
+      }
       const replyDelay = 2000 + Math.random() * 4000
       setTimeout(async () => {
         try {
@@ -373,7 +421,7 @@ async function handleMessage(lineId, sock, antiban, msg) {
             await randomDelay(1500, 3500)
             await sock.sendPresenceUpdate('composing', from)
 
-            const pitch = generatePitch()
+            const pitch = variator.vary(generatePitch())
             // 20% chance: pause mid-typing (mimics erasing/rethinking)
             if (Math.random() < 0.2) {
               await new Promise(r => setTimeout(r, typingDelay(pitch) * 0.4))
