@@ -37,9 +37,30 @@ app.post('/send', (req, res, next) => {
   }
   try {
     const jid = to.replace(/\D/g, '') + '@s.whatsapp.net'
+
+    // Apply anti-ban checks before sending
+    const antiban = session.antiban
+    if (antiban) {
+      const decision = await antiban.beforeSend(jid, text)
+      if (!decision.allowed) {
+        return res.status(429).json({ error: `Antiban: ${decision.reason}` })
+      }
+      await new Promise(r => setTimeout(r, decision.delayMs || 1500))
+    }
+
+    // Simulate typing before sending
+    try {
+      await session.socket.presenceSubscribe(jid)
+      await session.socket.sendPresenceUpdate('composing', jid)
+      await new Promise(r => setTimeout(r, 800 + Math.random() * 1500))
+    } catch {}
+
     await session.socket.sendMessage(jid, { text })
+
+    if (antiban) antiban.afterSend(jid, text)
     res.json({ ok: true })
   } catch (err) {
+    try { session.antiban?.afterSendFailed?.(err.message) } catch {}
     res.status(500).json({ error: err.message })
   }
 })

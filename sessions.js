@@ -3,6 +3,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  Browsers,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import { AntiBan } from 'baileys-antiban'
@@ -11,13 +12,22 @@ import fs from 'fs'
 import { notifyCapta } from './notify.js'
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
+const MAX_MESSAGE_AGE_SECONDS = 60 // Ignore messages older than 60s (stale on reconnect)
 const recentContacts = new Map()
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions_data'
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true })
 
-// Map of lineId -> { socket, qr, status, phone, antiban }
+// Map of lineId -> { socket, qr, status, phone, antiban, reconnectAttempts }
 const sessions = new Map()
+
+// --- Cleanup recentContacts every hour (prevent unbounded memory growth) ---
+setInterval(() => {
+  const now = Date.now()
+  for (const [key, ts] of recentContacts) {
+    if (now - ts > TWENTY_FOUR_HOURS) recentContacts.delete(key)
+  }
+}, 60 * 60 * 1000)
 
 export const sessionManager = {
   count: () => sessions.size,
@@ -39,13 +49,15 @@ export const sessionManager = {
     if (session?.socket) {
       try { await session.socket.logout() } catch {}
     }
+    // Save warm-up state before deleting
+    saveWarmUpState(lineId, session?.antiban)
     sessions.delete(lineId)
     const sessionPath = path.join(SESSIONS_DIR, lineId)
     if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true })
   },
 }
 
-// Pitch templates with leet speak to avoid keyword detection
+// --- Pitch templates with leet speak (3 variants, rotated randomly) ---
 const PITCH_TEMPLATES = [
   `Soy Roma❤️\nTengo para ofrecerte las dos mejores opciones del mercado!\n\nGanamos 🔮(La más buscada)\nZeus ⚡ (Original)\n\n💰Mínimo de c4rg4 $2000\n💰Mínimo de R3T1R0 $4000\n🎁 C4rgando te REGALAMOS un B0N0 de 40% 🤑💰🎁\n\nAtención personalizada las 24hs 💬\n\nDecime tu nombre o apodo y te creó tu USU4RI0`,
   `Hola! Soy Roma 💜\nTe cuento las opciones que tenemos!\n\nGanamos 🔮 (La favorita)\nZeus ⚡ (La clásica)\n\n💰 C4rga mínima: $2000\n💰 R3tir0 mínimo: $4000\n🎁 B0nus del 40% en tu primera c4rga 🤑\n\nEstoy 24/7 para ayudarte 💬\n\nPasame tu nombre y te armo el USU4RI0`,
@@ -60,6 +72,23 @@ function generatePitch() {
 
 function randomDelay(min, max) {
   return new Promise(r => setTimeout(r, min + Math.random() * (max - min)))
+}
+
+function saveWarmUpState(lineId, antiban) {
+  if (!antiban) return
+  try {
+    const warmUpStatePath = path.join(SESSIONS_DIR, lineId, 'warmup_state.json')
+    fs.writeFileSync(warmUpStatePath, JSON.stringify(antiban.exportWarmUpState()))
+  } catch {}
+}
+
+function getReconnectDelay(attempts) {
+  // Exponential backoff: 5s, 10s, 20s, 40s, 80s — max 5 min
+  const base = 5000
+  const delay = Math.min(base * Math.pow(2, attempts), 5 * 60 * 1000)
+  // Add jitter ±30%
+  const jitter = delay * 0.3 * (Math.random() * 2 - 1)
+  return Math.round(delay + jitter)
 }
 
 async function startSession(lineId) {
@@ -88,7 +117,7 @@ async function startSession(lineId) {
         maxDelayMs: 7000,
         newChatDelayMs: 4000,
         burstAllowance: 2,
-        identicalMessageWindowMs: 0, // pitch is already varied
+        identicalMessageWindowMs: 3600000, // re-enable: 1 hour window
       },
       warmUp: {
         warmUpDays: 7,
@@ -99,7 +128,7 @@ async function startSession(lineId) {
       health: {
         autoPauseAt: 'high',
         onRiskChange: (status) => {
-          console.log(`[${lineId}] Health: ${status.risk} (score: ${status.score}) — ${status.recommendation}`)
+          console.log(`[${lineId}] Health: ${status.risk} (score: ${status.score}) — ${status.recommendation || ''}`)
         },
       },
       logging: false,
@@ -107,12 +136,25 @@ async function startSession(lineId) {
     savedWarmUpState
   )
 
-  const sessionData = { status: 'connecting', qr: null, phone: null, socket: null, antiban }
+  const sessionData = {
+    status: 'connecting',
+    qr: null,
+    phone: null,
+    socket: null,
+    antiban,
+    reconnectAttempts: 0,
+  }
   sessions.set(lineId, sessionData)
 
   const sock = makeWASocket({
     version,
     auth: state,
+    // Anti-fingerprint: identify as real WhatsApp Web client, not Baileys
+    browser: Browsers.ubuntu('Chrome'),
+    // Don't mark online immediately — avoids automated "always online" pattern
+    markOnlineOnConnect: false,
+    // Don't generate link previews — reduces server-side API calls
+    generateHighQualityLinkPreview: false,
     printQRInTerminal: false,
     logger: (() => { const l = { level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {} }; l.child = () => l; return l })(),
   })
@@ -120,12 +162,7 @@ async function startSession(lineId) {
   sessionData.socket = sock
 
   // Persist warm-up state every 5 minutes
-  const warmUpPersistInterval = setInterval(() => {
-    try {
-      const wuState = antiban.exportWarmUpState()
-      fs.writeFileSync(warmUpStatePath, JSON.stringify(wuState))
-    } catch {}
-  }, 5 * 60 * 1000)
+  const warmUpPersistInterval = setInterval(() => saveWarmUpState(lineId, antiban), 5 * 60 * 1000)
 
   sock.ev.on('creds.update', saveCreds)
 
@@ -141,26 +178,42 @@ async function startSession(lineId) {
       sessionData.status = 'connected'
       sessionData.qr = null
       sessionData.phone = sock.user?.id?.split(':')[0] || null
+      sessionData.reconnectAttempts = 0 // Reset backoff on success
       console.log(`[${lineId}] Connected as ${sessionData.phone}`)
+
+      // Notify antiban of successful reconnection
+      try { antiban.onReconnect?.() } catch {}
+
       await notifyCapta(lineId, 'connected', { phone: sessionData.phone })
     }
 
     if (connection === 'close') {
       clearInterval(warmUpPersistInterval)
-      // Save warm-up state before closing
-      try {
-        fs.writeFileSync(warmUpStatePath, JSON.stringify(antiban.exportWarmUpState()))
-      } catch {}
+      saveWarmUpState(lineId, antiban)
 
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
       console.log(`[${lineId}] Disconnected: ${reason}`)
       sessionData.status = 'disconnected'
+
+      // Notify antiban of disconnect (feeds health monitor)
+      try { antiban.onDisconnect?.(reason) } catch {}
+
       await notifyCapta(lineId, 'disconnected', { reason })
 
       const shouldReconnect = reason !== DisconnectReason.loggedOut
       if (shouldReconnect) {
-        console.log(`[${lineId}] Reconnecting...`)
-        setTimeout(() => startSession(lineId), 3000)
+        sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1
+
+        // Cap reconnect attempts to avoid infinite loops on temp bans
+        if (sessionData.reconnectAttempts > 10) {
+          console.log(`[${lineId}] Max reconnect attempts reached, giving up`)
+          sessions.delete(lineId)
+          return
+        }
+
+        const delay = getReconnectDelay(sessionData.reconnectAttempts)
+        console.log(`[${lineId}] Reconnecting in ${Math.round(delay / 1000)}s (attempt ${sessionData.reconnectAttempts})...`)
+        setTimeout(() => startSession(lineId), delay)
       } else {
         sessions.delete(lineId)
       }
@@ -171,6 +224,17 @@ async function startSession(lineId) {
     if (type !== 'notify') return
     for (const msg of messages) {
       if (msg.key.fromMe) continue
+
+      // --- Filter: skip stale messages delivered during reconnect ---
+      const now = Math.floor(Date.now() / 1000)
+      const msgTime = typeof msg.messageTimestamp === 'number'
+        ? msg.messageTimestamp
+        : msg.messageTimestamp?.low || 0
+      if (msgTime > 0 && now - msgTime > MAX_MESSAGE_AGE_SECONDS) {
+        console.log(`[${lineId}] Skipping stale message (${now - msgTime}s old)`)
+        continue
+      }
+
       await handleMessage(lineId, sock, antiban, msg)
     }
   })
@@ -180,7 +244,13 @@ async function startSession(lineId) {
 
 async function handleMessage(lineId, sock, antiban, msg) {
   const from = msg.key.remoteJid
-  const phone = from?.replace('@s.whatsapp.net', '').replace('@g.us', '').replace('@lid', '')
+
+  // --- Filter: only handle private 1-on-1 chats ---
+  if (!from || from.endsWith('@g.us') || from === 'status@broadcast' || from.endsWith('@newsletter') || from.endsWith('@lid')) {
+    return
+  }
+
+  const phone = from.replace('@s.whatsapp.net', '')
   const content = msg.message
 
   // Check for image (comprobante)
@@ -217,7 +287,6 @@ async function handleMessage(lineId, sock, antiban, msg) {
       await notifyCapta(lineId, 'conversation_start', { phone, text })
 
       // Auto-reply: greeting + pitch (like Convertix)
-      // Delay 2-6s to simulate human reaction time
       const replyDelay = 2000 + Math.random() * 4000
       setTimeout(async () => {
         try {
@@ -254,9 +323,23 @@ async function handleMessage(lineId, sock, antiban, msg) {
 
           console.log(`[${lineId}] Auto-reply sent to ${phone}`)
         } catch (err) {
+          // Notify antiban of failed send so health monitor tracks it
+          try { antiban.afterSendFailed?.(err.message) } catch {}
           console.error(`[${lineId}] Auto-reply error:`, err.message)
         }
       }, replyDelay)
     }
   }
 }
+
+// --- Graceful shutdown: save all warm-up states ---
+function gracefulShutdown(signal) {
+  console.log(`[Baileys] ${signal} received, saving state...`)
+  for (const [lineId, session] of sessions) {
+    saveWarmUpState(lineId, session.antiban)
+  }
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
