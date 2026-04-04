@@ -54,11 +54,13 @@ app.post('/send', (req, res, next) => {
       await new Promise(r => setTimeout(r, decision.delayMs || 1500))
     }
 
-    // Simulate typing before sending
+    // Simulate typing proportional to message length
     try {
       await session.socket.presenceSubscribe(jid)
       await session.socket.sendPresenceUpdate('composing', jid)
-      await new Promise(r => setTimeout(r, 800 + Math.random() * 1500))
+      const charMs = 40 + Math.random() * 30
+      const typeDuration = Math.max(Math.min(text.length * charMs, 8000), 800) + Math.random() * 1000
+      await new Promise(r => setTimeout(r, typeDuration))
     } catch {}
 
     await session.socket.sendMessage(jid, { text })

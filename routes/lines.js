@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { sessionManager } from '../sessions.js'
+import { sessionManager, getWarmUpDay } from '../sessions.js'
 import QRCode from 'qrcode'
 
 const router = Router()
@@ -42,6 +42,32 @@ router.get('/:lineId/status', (req, res) => {
   const session = sessionManager.get(lineId)
   if (!session) return res.json({ status: 'not_started' })
   res.json({ status: session.status, phone: session.phone, hasQR: !!session.qr })
+})
+
+// GET /lines/:lineId/health — antiban health status
+router.get('/:lineId/health', (req, res) => {
+  const { lineId } = req.params
+  const session = sessionManager.get(lineId)
+  if (!session) return res.status(404).json({ error: 'Session not found' })
+
+  const antiban = session.antiban
+  if (!antiban) return res.json({ status: 'no_antiban' })
+
+  try {
+    const health = antiban.getHealthStatus?.() || {}
+    const warmUpDay = getWarmUpDay(antiban)
+    const warmUpState = antiban.exportWarmUpState?.() || {}
+    res.json({
+      risk: health.risk || 'unknown',
+      score: health.score ?? null,
+      recommendation: health.recommendation || null,
+      warmUpDay,
+      warmUpStartDate: warmUpState.startDate || null,
+      messagestoday: warmUpState.messagesToday ?? null,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
 })
 
 // DELETE /lines/:lineId — logout and delete session

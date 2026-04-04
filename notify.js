@@ -11,6 +11,10 @@ const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
 const disconnectAlertThrottle = new Map()
 const THROTTLE_MS = 5 * 60 * 1000
 
+export async function sendTelegramAlert(text) {
+  return sendTelegram(text)
+}
+
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN
   const chatId = process.env.TELEGRAM_CHAT_ID

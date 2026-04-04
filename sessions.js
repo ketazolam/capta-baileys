@@ -9,7 +9,7 @@ import { Boom } from '@hapi/boom'
 import { AntiBan } from 'baileys-antiban'
 import path from 'path'
 import fs from 'fs'
-import { notifyCapta } from './notify.js'
+import { notifyCapta, sendTelegramAlert } from './notify.js'
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
 const MAX_MESSAGE_AGE_SECONDS = 60 // Ignore messages older than 60s (stale on reconnect)
@@ -78,6 +78,13 @@ function randomDelay(min, max) {
   return new Promise(r => setTimeout(r, min + Math.random() * (max - min)))
 }
 
+// Simulate realistic typing duration based on message length (~40-70ms per char, capped)
+function typingDelay(text) {
+  const charMs = 40 + Math.random() * 30 // 40-70ms per character
+  const base = Math.min(text.length * charMs, 8000) // cap at 8s
+  return Math.max(base, 800) + Math.random() * 1000 // min 800ms + jitter
+}
+
 // Returns the warm-up day (1-based) for a line, or null if warm-up is complete
 export function getWarmUpDay(antiban) {
   try {
@@ -144,6 +151,13 @@ async function startSession(lineId) {
         autoPauseAt: 'high',
         onRiskChange: (status) => {
           console.log(`[${lineId}] Health: ${status.risk} (score: ${status.score}) — ${status.recommendation || ''}`)
+          // Alert on medium/high risk escalation via Telegram
+          if (status.risk === 'medium' || status.risk === 'high') {
+            const emoji = status.risk === 'high' ? '🔴' : '🟡'
+            sendTelegramAlert(
+              `${emoji} <b>Antiban ${status.risk.toUpperCase()}</b> — línea ${lineId.slice(0, 8)}\nScore: ${status.score}\n${status.recommendation || ''}`
+            )
+          }
         },
       },
       logging: false,
@@ -283,6 +297,11 @@ async function handleMessage(lineId, sock, antiban, msg) {
     return
   }
 
+  // --- Filter: skip automated/bot messages (protocol messages, reactions, polls) ---
+  if (msg.message?.protocolMessage || msg.message?.reactionMessage || msg.message?.pollCreationMessage || msg.message?.pollUpdateMessage) {
+    return
+  }
+
   const phone = from.replace('@s.whatsapp.net', '')
   const content = msg.message
 
@@ -333,9 +352,9 @@ async function handleMessage(lineId, sock, antiban, msg) {
           // --- Step 1: Short greeting ---
           await sock.presenceSubscribe(from)
           await sock.sendPresenceUpdate('composing', from)
-          await randomDelay(800, 1800)
 
           const greeting = GREETINGS[Math.floor(Math.random() * GREETINGS.length)]
+          await new Promise(r => setTimeout(r, typingDelay(greeting)))
           const decision1 = await antiban.beforeSend(from, greeting)
           if (!decision1.allowed) {
             console.log(`[${lineId}] Antiban blocked greeting: ${decision1.reason}`)
@@ -353,10 +372,18 @@ async function handleMessage(lineId, sock, antiban, msg) {
           } else {
             await randomDelay(1500, 3500)
             await sock.sendPresenceUpdate('composing', from)
-            await randomDelay(2000, 4000)
-            await sock.sendPresenceUpdate('paused', from)
 
             const pitch = generatePitch()
+            // 20% chance: pause mid-typing (mimics erasing/rethinking)
+            if (Math.random() < 0.2) {
+              await new Promise(r => setTimeout(r, typingDelay(pitch) * 0.4))
+              await sock.sendPresenceUpdate('paused', from)
+              await randomDelay(500, 1500)
+              await sock.sendPresenceUpdate('composing', from)
+            }
+            await new Promise(r => setTimeout(r, typingDelay(pitch)))
+            await sock.sendPresenceUpdate('paused', from)
+            await randomDelay(300, 800) // brief pause after "finishing typing"
             const decision2 = await antiban.beforeSend(from, pitch)
             if (!decision2.allowed) {
               console.log(`[${lineId}] Antiban blocked pitch: ${decision2.reason}`)
