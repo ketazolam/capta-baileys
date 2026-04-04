@@ -32,12 +32,26 @@ export async function notifyCapta(lineId, event, data) {
         await supabase.from('lines').update({ status: 'qr_pending' }).eq('id', lineId)
         break
 
-      case 'connected':
+      case 'connected': {
         await supabase.from('lines').update({
           status: 'connected',
           phone_number: data.phone,
         }).eq('id', lineId)
+
+        // Solo notificar si hubo una desconexion previa detectada (no en startup)
+        if (disconnectAlertThrottle.has(lineId)) {
+          disconnectAlertThrottle.delete(lineId) // reset para proximo ciclo
+          const { data: connLine } = await supabase
+            .from('lines')
+            .select('name, projects(name)')
+            .eq('id', lineId)
+            .single()
+          const lineName = connLine?.name || lineId
+          const projectName = connLine?.projects?.name ? ` — proyecto <b>${connLine.projects.name}</b>` : ''
+          await sendTelegram(`✅ <b>Linea reconectada${projectName}</b>\n📱 ${lineName} (+${data.phone})`)
+        }
         break
+      }
 
       case 'disconnected': {
         await supabase.from('lines').update({ status: 'disconnected' }).eq('id', lineId)
