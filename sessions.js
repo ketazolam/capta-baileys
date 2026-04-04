@@ -120,9 +120,11 @@ function saveWarmUpState(lineId, antiban) {
 }
 
 function getReconnectDelay(attempts) {
-  // Exponential backoff: 5s, 10s, 20s, 40s, 80s — max 5 min
+  // Exponential backoff: 5s → 10s → 20s → 40s → 80s → 160s → 320s → ... → max 30min
+  // After 5+ failures: delays exceed 2.5 min — acts as circuit breaker
+  // After 8+ failures: delays hit 30 min cap — prevents reconnect storm
   const base = 5000
-  const delay = Math.min(base * Math.pow(2, attempts), 5 * 60 * 1000)
+  const delay = Math.min(base * Math.pow(2, attempts), 30 * 60 * 1000)
   // Add jitter ±30%
   const jitter = delay * 0.3 * (Math.random() * 2 - 1)
   return Math.round(delay + jitter)
@@ -271,6 +273,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
         console.log(`[${lineId}] Simulated disconnect (no alert), reconnecting...`)
       } else {
         console.log(`[${lineId}] Disconnected: ${reason}`)
+        // Log critical error codes that signal impending ban
+        if (reason === 403) console.error(`[${lineId}] ⚠️ 403 FORBIDDEN — account may be flagged`)
+        if (reason === 463) console.error(`[${lineId}] ⚠️ 463 REACH-OUT TIMELOCK — too many messages to unknown contacts`)
         // Notify antiban of disconnect (feeds health monitor)
         try { antiban.onDisconnect?.(reason) } catch {}
         await notifyCapta(lineId, 'disconnected', { reason })
@@ -316,52 +321,59 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
     }
   })
 
-  // --- Simulate human presence: go online/offline periodically ---
-  const presenceInterval = setInterval(async () => {
-    if (sessionData.status !== 'connected') return
-    // Skip if outside active hours — go fully unavailable
-    if (!isActiveTime()) {
-      try { await sock.sendPresenceUpdate('unavailable') } catch {}
-      return
-    }
-    // 30% chance: skip this cycle entirely (humans aren't always consistent)
-    if (Math.random() < 0.3) return
-    try {
-      await sock.sendPresenceUpdate('available')
-      // Stay online for 20s–5min, then go offline
-      const onlineDuration = 20000 + Math.random() * 280000
-      setTimeout(async () => {
+  // --- Simulate human presence: go online/offline with VARIABLE intervals ---
+  // Fixed setInterval is a fingerprint — real humans are never periodic.
+  // Use recursive setTimeout so each cycle has a different delay.
+  let presenceTimer = null
+  function schedulePresenceCycle() {
+    const nextDelay = (15 + Math.random() * 45) * 60 * 1000 // 15-60 min, different each time
+    presenceTimer = setTimeout(async () => {
+      if (sessionData.status !== 'connected') { schedulePresenceCycle(); return }
+      if (!isActiveTime()) {
         try { await sock.sendPresenceUpdate('unavailable') } catch {}
-      }, onlineDuration)
-    } catch {}
-  }, (15 + Math.random() * 45) * 60 * 1000) // Every 15-60 min
+        schedulePresenceCycle(); return
+      }
+      // 30% chance: skip this cycle entirely (humans aren't always consistent)
+      if (Math.random() < 0.3) { schedulePresenceCycle(); return }
+      try {
+        await sock.sendPresenceUpdate('available')
+        const onlineDuration = 20000 + Math.random() * 280000 // 20s–5min
+        setTimeout(async () => {
+          try { await sock.sendPresenceUpdate('unavailable') } catch {}
+        }, onlineDuration)
+      } catch {}
+      schedulePresenceCycle()
+    }, nextDelay)
+  }
+  schedulePresenceCycle()
 
   // --- Simulate natural connection drops (phone sleep, network switch) ---
-  // Every 3-6 hours, briefly disconnect and reconnect the WebSocket
-  // This mimics WiFi→mobile handoffs and natural connection resets
-  const connectionDropInterval = setInterval(async () => {
-    if (sessionData.status !== 'connected') return
-    // Only drop during low-activity hours (Argentina time)
-    const hour = argentinaHour()
-    if (hour >= 1 && hour <= 6) {
-      // Night: 40% chance of a long "sleep" disconnect (30-90 min)
-      if (Math.random() < 0.4) {
-        console.log(`[${lineId}] Simulating night sleep disconnect`)
-        sessionData.simulatedDisconnect = true
-        try { await sock.ws.close() } catch {}
-        // The reconnect handler will pick this up and reconnect after backoff
+  // Variable interval (not fixed setInterval) — real devices aren't periodic
+  let connectionDropTimer = null
+  function scheduleConnectionDrop() {
+    const nextDelay = (3 + Math.random() * 3) * 60 * 60 * 1000 // 3-6 hours, different each time
+    connectionDropTimer = setTimeout(async () => {
+      if (sessionData.status !== 'connected') { scheduleConnectionDrop(); return }
+      const hour = argentinaHour()
+      if (hour >= 1 && hour <= 6) {
+        // Night: 40% chance of a long "sleep" disconnect
+        if (Math.random() < 0.4) {
+          console.log(`[${lineId}] Simulating night sleep disconnect`)
+          sessionData.simulatedDisconnect = true
+          try { await sock.ws.close() } catch {}
+          return // Don't reschedule — reconnect flow will create new session
+        }
+      } else {
+        // Day: 15% chance of a brief "network blip"
+        if (Math.random() < 0.15) {
+          console.log(`[${lineId}] Simulating network blip`)
+          try { await sock.sendPresenceUpdate('unavailable') } catch {}
+        }
       }
-    } else {
-      // Day: 15% chance of a brief "network blip"
-      if (Math.random() < 0.15) {
-        console.log(`[${lineId}] Simulating network blip`)
-        try {
-          await sock.sendPresenceUpdate('unavailable')
-          // Brief pause before the socket naturally reconnects
-        } catch {}
-      }
-    }
-  }, (3 + Math.random() * 3) * 60 * 60 * 1000) // Every 3-6 hours
+      scheduleConnectionDrop()
+    }, nextDelay)
+  }
+  scheduleConnectionDrop()
 
   // --- Self-chat outbound seeding: add outbound traffic to look like a real user ---
   // A number that only receives and never sends is statistically anomalous.
@@ -381,8 +393,8 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
   // Clean up intervals on disconnect
   sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'close') {
-      clearInterval(presenceInterval)
-      clearInterval(connectionDropInterval)
+      clearTimeout(presenceTimer)
+      clearTimeout(connectionDropTimer)
       clearInterval(selfChatInterval)
     }
   })
