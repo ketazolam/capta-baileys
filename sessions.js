@@ -64,7 +64,11 @@ const PITCH_TEMPLATES = [
   `Roma acá! ❤️\nMirá lo que tengo para vos:\n\nGanamos 🔮 (Top 1)\nZeus ⚡ (Original)\n\n💰 Mín. c4rg4: $2000\n💰 Mín. R3T1R0: $4000\n🎁 40% de B0N0 en la 1ra c4rga 💰🎁\n\n24hs online ✅\n\nDecime un nombre para crear tu USU4RI0`,
 ]
 
-const GREETINGS = ['holii', 'holaaa', 'hola!', 'buenass', 'hey hola!']
+const GREETINGS = [
+  'holii', 'holaaa', 'hola!', 'buenass', 'hey hola!',
+  'holaa', 'buenas!', 'hola hola', 'holi!', 'eyyy hola',
+  'que onda!', 'hola buen dia', 'buenas tardes!', 'hola como estas',
+]
 
 function generatePitch() {
   return PITCH_TEMPLATES[Math.floor(Math.random() * PITCH_TEMPLATES.length)]
@@ -75,7 +79,7 @@ function randomDelay(min, max) {
 }
 
 // Returns the warm-up day (1-based) for a line, or null if warm-up is complete
-function getWarmUpDay(antiban) {
+export function getWarmUpDay(antiban) {
   try {
     const state = antiban.exportWarmUpState?.()
     if (!state?.startDate) return null
@@ -250,6 +254,24 @@ async function startSession(lineId) {
     }
   })
 
+  // --- Simulate human presence: go online/offline periodically ---
+  const presenceInterval = setInterval(async () => {
+    if (sessionData.status !== 'connected') return
+    try {
+      await sock.sendPresenceUpdate('available')
+      // Stay online for 30s–2min, then go offline
+      const onlineDuration = 30000 + Math.random() * 90000
+      setTimeout(async () => {
+        try { await sock.sendPresenceUpdate('unavailable') } catch {}
+      }, onlineDuration)
+    } catch {}
+  }, (10 + Math.random() * 20) * 60 * 1000) // Every 10-30 min
+
+  // Clean up presence interval on disconnect
+  sock.ev.on('connection.update', ({ connection }) => {
+    if (connection === 'close') clearInterval(presenceInterval)
+  })
+
   return sessionData
 }
 
@@ -263,6 +285,13 @@ async function handleMessage(lineId, sock, antiban, msg) {
 
   const phone = from.replace('@s.whatsapp.net', '')
   const content = msg.message
+
+  // --- Mark message as read after a human-like delay ---
+  setTimeout(async () => {
+    try {
+      await sock.readMessages([msg.key])
+    } catch {}
+  }, 1500 + Math.random() * 3000)
 
   // Check for image (comprobante)
   const imageMsg = content?.imageMessage

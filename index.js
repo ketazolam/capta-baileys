@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager } from './sessions.js'
+import { sessionManager, getWarmUpDay } from './sessions.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -41,6 +41,12 @@ app.post('/send', (req, res, next) => {
     // Apply anti-ban checks before sending
     const antiban = session.antiban
     if (antiban) {
+      // Block link/promo messages during warm-up days 1-2
+      const warmUpDay = getWarmUpDay(antiban)
+      if (warmUpDay && warmUpDay <= 2 && /https?:\/\/|wa\.me|bit\.ly/i.test(text)) {
+        return res.status(429).json({ error: `Warm-up day ${warmUpDay}: links not allowed yet` })
+      }
+
       const decision = await antiban.beforeSend(jid, text)
       if (!decision.allowed) {
         return res.status(429).json({ error: `Antiban: ${decision.reason}` })
