@@ -6,7 +6,7 @@ import makeWASocket, {
   Browsers,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
-import { AntiBan, ContentVariator, Scheduler } from 'baileys-antiban'
+import { AntiBan, Scheduler } from 'baileys-antiban'
 import path from 'path'
 import fs from 'fs'
 import { notifyCapta, sendTelegramAlert } from './notify.js'
@@ -20,14 +20,6 @@ if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true }
 
 // Map of lineId -> { socket, qr, status, phone, antiban, reconnectAttempts }
 const sessions = new Map()
-
-// Content variator: makes each message technically unique (zero-width chars, punctuation)
-const variator = new ContentVariator({
-  zeroWidthChars: true,
-  punctuationVariation: true,
-  emojiPadding: false,
-  synonyms: false, // don't replace Spanish words with English synonyms
-})
 
 // Scheduler: only send during realistic hours (Argentina timezone)
 export const scheduler = new Scheduler({
@@ -72,45 +64,6 @@ export const sessionManager = {
     const sessionPath = path.join(SESSIONS_DIR, lineId)
     if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true })
   },
-}
-
-// --- Pitch templates (7 variants with varied structures) ---
-const PITCH_TEMPLATES = [
-  // Full pitch — leet speak variant A
-  `Soy Roma❤️\nTengo para ofrecerte las dos mejores opciones del mercado!\n\nGanamos 🔮(La más buscada)\nZeus ⚡ (Original)\n\n💰Mínimo de c4rg4 $2000\n💰Mínimo de R3T1R0 $4000\n🎁 C4rgando te REGALAMOS un B0N0 de 40% 🤑💰🎁\n\nAtención personalizada las 24hs 💬\n\nDecime tu nombre o apodo y te creó tu USU4RI0`,
-  // Full pitch — leet speak variant B
-  `Hola! Soy Roma 💜\nTe cuento las opciones que tenemos!\n\nGanamos 🔮 (La favorita)\nZeus ⚡ (La clásica)\n\n💰 C4rga mínima: $2000\n💰 R3tir0 mínimo: $4000\n🎁 B0nus del 40% en tu primera c4rga 🤑\n\nEstoy 24/7 para ayudarte 💬\n\nPasame tu nombre y te armo el USU4RI0`,
-  // Full pitch — leet speak variant C
-  `Roma acá! ❤️\nMirá lo que tengo para vos:\n\nGanamos 🔮 (Top 1)\nZeus ⚡ (Original)\n\n💰 Mín. c4rg4: $2000\n💰 Mín. R3T1R0: $4000\n🎁 40% de B0N0 en la 1ra c4rga 💰🎁\n\n24hs online ✅\n\nDecime un nombre para crear tu USU4RI0`,
-  // Short pitch — casual (for warm-up day 3-4)
-  `Soy Roma 💕\nTenemos dos plataformas increíbles:\n🔮 Ganamos\n⚡ Zeus\n\nSi te interesa pasame tu nombre y te armo todo!`,
-  // Question-style — engages conversation
-  `Hola! Soy Roma ✨\nEstás buscando una plataforma para jugar?\n\nTenemos Ganamos 🔮 y Zeus ⚡\nAmbas con b0nus de bienvenida 🎁\n\nQuerés que te cuente más?`,
-  // Short + emojis different set
-  `Roma! 🙋‍♀️\nTe presento nuestras opciones:\n\n🎰 Ganamos — la más popular\n⚡ Zeus — la original\n\n🎁 Primer c4rg4 con 40% extra\n📲 Pasame un nombre y arrancamos`,
-  // Ultra short — for high-volume days
-  `Hola! Soy Roma 🤗\nTenemos las mejores plataformas con b0nus de bienvenida\nDecime tu nombre y te creo el acceso 🔑`,
-]
-
-const GREETINGS = [
-  'holii', 'holaaa', 'hola!', 'buenass', 'hey hola!',
-  'holaa', 'buenas!', 'hola hola', 'holi!', 'eyyy hola',
-  'que onda!', 'hola buen dia', 'buenas tardes!', 'hola como estas',
-]
-
-function generatePitch() {
-  return PITCH_TEMPLATES[Math.floor(Math.random() * PITCH_TEMPLATES.length)]
-}
-
-function randomDelay(min, max) {
-  return new Promise(r => setTimeout(r, min + Math.random() * (max - min)))
-}
-
-// Simulate realistic typing duration based on message length (~40-70ms per char, capped)
-function typingDelay(text) {
-  const charMs = 40 + Math.random() * 30 // 40-70ms per character
-  const base = Math.min(text.length * charMs, 8000) // cap at 8s
-  return Math.max(base, 800) + Math.random() * 1000 // min 800ms + jitter
 }
 
 // Returns the warm-up day (1-based) for a line, or null if warm-up is complete
@@ -300,7 +253,7 @@ async function startSession(lineId) {
         continue
       }
 
-      await handleMessage(lineId, sock, antiban, msg)
+      await handleMessage(lineId, sock, msg)
     }
   })
 
@@ -329,7 +282,7 @@ async function startSession(lineId) {
   return sessionData
 }
 
-async function handleMessage(lineId, sock, antiban, msg) {
+async function handleMessage(lineId, sock, msg) {
   const from = msg.key.remoteJid
 
   // --- Filter: only handle private 1-on-1 chats ---
@@ -387,68 +340,8 @@ async function handleMessage(lineId, sock, antiban, msg) {
     if (isNewContact) {
       recentContacts.set(contactKey, Date.now())
       await notifyCapta(lineId, 'conversation_start', { phone, text })
-
-      // Auto-reply: greeting + pitch (like Convertix)
-      // Skip auto-reply outside active hours
-      if (!scheduler.isActiveTime()) {
-        console.log(`[${lineId}] Outside active hours, skipping auto-reply to ${phone}`)
-        return
-      }
-      const replyDelay = 2000 + Math.random() * 4000
-      setTimeout(async () => {
-        try {
-          // --- Step 1: Short greeting ---
-          await sock.presenceSubscribe(from)
-          await sock.sendPresenceUpdate('composing', from)
-
-          const greeting = GREETINGS[Math.floor(Math.random() * GREETINGS.length)]
-          await new Promise(r => setTimeout(r, typingDelay(greeting)))
-          const decision1 = await antiban.beforeSend(from, greeting)
-          if (!decision1.allowed) {
-            console.log(`[${lineId}] Antiban blocked greeting: ${decision1.reason}`)
-            return
-          }
-          await randomDelay(decision1.delayMs, decision1.delayMs + 500)
-          await sock.sendMessage(from, { text: greeting })
-          antiban.afterSend(from, greeting)
-
-          // --- Step 2: Sales pitch after human pause ---
-          // Skip pitch during first 2 warm-up days (no links/promos — Convertix best practice)
-          const warmUpDay = getWarmUpDay(antiban)
-          if (warmUpDay && warmUpDay <= 2) {
-            console.log(`[${lineId}] Warm-up day ${warmUpDay}: skipping pitch (no links/promos)`)
-          } else {
-            await randomDelay(1500, 3500)
-            await sock.sendPresenceUpdate('composing', from)
-
-            const pitch = variator.vary(generatePitch())
-            // 20% chance: pause mid-typing (mimics erasing/rethinking)
-            if (Math.random() < 0.2) {
-              await new Promise(r => setTimeout(r, typingDelay(pitch) * 0.4))
-              await sock.sendPresenceUpdate('paused', from)
-              await randomDelay(500, 1500)
-              await sock.sendPresenceUpdate('composing', from)
-            }
-            await new Promise(r => setTimeout(r, typingDelay(pitch)))
-            await sock.sendPresenceUpdate('paused', from)
-            await randomDelay(300, 800) // brief pause after "finishing typing"
-            const decision2 = await antiban.beforeSend(from, pitch)
-            if (!decision2.allowed) {
-              console.log(`[${lineId}] Antiban blocked pitch: ${decision2.reason}`)
-              return
-            }
-            await randomDelay(decision2.delayMs, decision2.delayMs + 500)
-            await sock.sendMessage(from, { text: pitch })
-            antiban.afterSend(from, pitch)
-          }
-
-          console.log(`[${lineId}] Auto-reply sent to ${phone}`)
-        } catch (err) {
-          // Notify antiban of failed send so health monitor tracks it
-          try { antiban.afterSendFailed?.(err.message) } catch {}
-          console.error(`[${lineId}] Auto-reply error:`, err.message)
-        }
-      }, replyDelay)
+      // No auto-reply — human operator handles all outbound communication.
+      // Baileys only manages: lead intake, read receipts, presence, anti-ban.
     }
   }
 }
