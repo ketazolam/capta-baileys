@@ -6,7 +6,7 @@ import makeWASocket, {
   Browsers,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
-import { AntiBan, Scheduler } from 'baileys-antiban'
+import { AntiBan, Scheduler, ContentVariator } from 'baileys-antiban'
 import path from 'path'
 import fs from 'fs'
 import { notifyCapta, sendTelegramAlert } from './notify.js'
@@ -20,6 +20,15 @@ if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true }
 
 // Map of lineId -> { socket, qr, status, phone, antiban, reconnectAttempts }
 const sessions = new Map()
+
+// Content variator: makes each outbound message technically unique (zero-width chars)
+// Applied in /send endpoint so human's copy-pasted pitches are never identical
+export const variator = new ContentVariator({
+  zeroWidthChars: true,
+  punctuationVariation: true,
+  emojiPadding: false,
+  synonyms: false,
+})
 
 // Scheduler: only send during realistic hours (Argentina timezone)
 export const scheduler = new Scheduler({
@@ -168,7 +177,7 @@ async function startSession(lineId) {
     printQRInTerminal: false,
     // --- Anti-detection tuning ---
     emitOwnEvents: false,           // Don't fire events for own messages (reduces noise)
-    fireInitQueries: false,          // Don't query app state on connect (bots do this, humans don't)
+    // fireInitQueries: true (default) — KEEP ON. WA servers expect init queries; skipping them is suspicious.
     retryRequestDelayMs: 500,        // Slower retries (default 250ms is too fast/bot-like)
     maxMsgRetryCount: 3,             // Fewer retries (default 5 is aggressive)
     shouldIgnoreJid: (jid) =>        // Skip system/broadcast JIDs at socket level
@@ -260,8 +269,11 @@ async function startSession(lineId) {
   // --- Simulate human presence: go online/offline periodically ---
   const presenceInterval = setInterval(async () => {
     if (sessionData.status !== 'connected') return
-    // Skip if outside active hours
-    if (!scheduler.isActiveTime()) return
+    // Skip if outside active hours — go fully unavailable
+    if (!scheduler.isActiveTime()) {
+      try { await sock.sendPresenceUpdate('unavailable') } catch {}
+      return
+    }
     // 30% chance: skip this cycle entirely (humans aren't always consistent)
     if (Math.random() < 0.3) return
     try {
@@ -274,9 +286,38 @@ async function startSession(lineId) {
     } catch {}
   }, (15 + Math.random() * 45) * 60 * 1000) // Every 15-60 min
 
-  // Clean up presence interval on disconnect
+  // --- Simulate natural connection drops (phone sleep, network switch) ---
+  // Every 3-6 hours, briefly disconnect and reconnect the WebSocket
+  // This mimics WiFi→mobile handoffs and natural connection resets
+  const connectionDropInterval = setInterval(async () => {
+    if (sessionData.status !== 'connected') return
+    // Only drop during low-activity hours (late night or random)
+    const hour = new Date().getHours()
+    if (hour >= 1 && hour <= 6) {
+      // Night: 40% chance of a long "sleep" disconnect (30-90 min)
+      if (Math.random() < 0.4) {
+        console.log(`[${lineId}] Simulating night sleep disconnect`)
+        try { await sock.ws.close() } catch {}
+        // The reconnect handler will pick this up and reconnect after backoff
+      }
+    } else {
+      // Day: 15% chance of a brief "network blip"
+      if (Math.random() < 0.15) {
+        console.log(`[${lineId}] Simulating network blip`)
+        try {
+          await sock.sendPresenceUpdate('unavailable')
+          // Brief pause before the socket naturally reconnects
+        } catch {}
+      }
+    }
+  }, (3 + Math.random() * 3) * 60 * 60 * 1000) // Every 3-6 hours
+
+  // Clean up intervals on disconnect
   sock.ev.on('connection.update', ({ connection }) => {
-    if (connection === 'close') clearInterval(presenceInterval)
+    if (connection === 'close') {
+      clearInterval(presenceInterval)
+      clearInterval(connectionDropInterval)
+    }
   })
 
   return sessionData
@@ -301,12 +342,21 @@ async function handleMessage(lineId, sock, msg) {
   const phone = from.replace('@s.whatsapp.net', '')
   const content = msg.message
 
-  // --- Mark message as read after a human-like delay ---
-  setTimeout(async () => {
-    try {
-      await sock.readMessages([msg.key])
-    } catch {}
-  }, 1500 + Math.random() * 3000)
+  // --- Mark message as read with human-like patterns ---
+  // Not every message gets read immediately — 15% are "ignored" (read much later or never)
+  const readChance = Math.random()
+  if (readChance < 0.85) {
+    // 85%: read within 1-8 seconds (varied, not uniform)
+    const readDelay = readChance < 0.3
+      ? 500 + Math.random() * 1500    // 30%: quick read (0.5-2s)
+      : readChance < 0.6
+        ? 2000 + Math.random() * 4000 // 30%: normal read (2-6s)
+        : 5000 + Math.random() * 15000 // 25%: slow read (5-20s)
+    setTimeout(async () => {
+      try { await sock.readMessages([msg.key]) } catch {}
+    }, readDelay)
+  }
+  // 15%: never marked as read (human didn't open the chat)
 
   // Check for image (comprobante)
   const imageMsg = content?.imageMessage

@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager, getWarmUpDay, scheduler } from './sessions.js'
+import { sessionManager, getWarmUpDay, scheduler, variator } from './sessions.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -59,16 +59,23 @@ app.post('/send', (req, res, next) => {
       await new Promise(r => setTimeout(r, decision.delayMs || 1500))
     }
 
-    // Simulate typing proportional to message length
-    try {
-      await session.socket.presenceSubscribe(jid)
-      await session.socket.sendPresenceUpdate('composing', jid)
-      const charMs = 40 + Math.random() * 30
-      const typeDuration = Math.max(Math.min(text.length * charMs, 8000), 800) + Math.random() * 1000
-      await new Promise(r => setTimeout(r, typeDuration))
-    } catch {}
+    // Simulate typing — but not always (humans sometimes send quick replies)
+    // Short messages (<30 chars): 40% chance of no typing indicator
+    // Long messages: always show typing
+    const skipTyping = text.length < 30 && Math.random() < 0.4
+    if (!skipTyping) {
+      try {
+        await session.socket.presenceSubscribe(jid)
+        await session.socket.sendPresenceUpdate('composing', jid)
+        const charMs = 40 + Math.random() * 30
+        const typeDuration = Math.max(Math.min(text.length * charMs, 8000), 800) + Math.random() * 1000
+        await new Promise(r => setTimeout(r, typeDuration))
+      } catch {}
+    }
 
-    await session.socket.sendMessage(jid, { text })
+    // Apply content variation — zero-width chars make each send technically unique
+    const variedText = variator.vary(text)
+    await session.socket.sendMessage(jid, { text: variedText })
 
     if (antiban) antiban.afterSend(jid, text)
     res.json({ ok: true })
