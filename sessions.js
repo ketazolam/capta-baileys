@@ -6,7 +6,7 @@ import makeWASocket, {
   Browsers,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
-import { AntiBan, Scheduler, ContentVariator } from 'baileys-antiban'
+import { AntiBan, ContentVariator } from 'baileys-antiban'
 import path from 'path'
 import fs from 'fs'
 import { notifyCapta, sendTelegramAlert } from './notify.js'
@@ -14,6 +14,11 @@ import { notifyCapta, sendTelegramAlert } from './notify.js'
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
 const MAX_MESSAGE_AGE_SECONDS = 60 // Ignore messages older than 60s (stale on reconnect)
 const recentContacts = new Map()
+
+// Get current hour in Argentina timezone (UTC-3), works regardless of server TZ
+function argentinaHour() {
+  return new Date(Date.now() - 3 * 60 * 60 * 1000).getUTCHours()
+}
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions_data'
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true })
@@ -30,14 +35,11 @@ export const variator = new ContentVariator({
   synonyms: false,
 })
 
-// Scheduler: only send during realistic hours (Argentina timezone)
-export const scheduler = new Scheduler({
-  activeHours: [8, 23],     // 8 AM to 11 PM
-  peakHours: [10, 21],      // Faster during 10-21h
-  weekendFactor: 0.7,       // 30% less on weekends
-  lunchBreak: [13, 14],     // Slow down at lunch
-  lunchFactor: 0.5,
-})
+// Active hours check using Argentina timezone (NOT Scheduler — it uses server TZ which is UTC on Railway)
+export function isActiveTime() {
+  const hour = argentinaHour()
+  return hour >= 8 && hour < 23
+}
 
 // --- Cleanup recentContacts every hour (prevent unbounded memory growth) ---
 setInterval(() => {
@@ -162,6 +164,7 @@ async function startSession(lineId) {
     socket: null,
     antiban,
     reconnectAttempts: 0,
+    simulatedDisconnect: false, // Flag to suppress Telegram alerts on intentional drops
   }
   sessions.set(lineId, sessionData)
 
@@ -219,13 +222,18 @@ async function startSession(lineId) {
       saveWarmUpState(lineId, antiban)
 
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-      console.log(`[${lineId}] Disconnected: ${reason}`)
       sessionData.status = 'disconnected'
 
-      // Notify antiban of disconnect (feeds health monitor)
-      try { antiban.onDisconnect?.(reason) } catch {}
-
-      await notifyCapta(lineId, 'disconnected', { reason })
+      // Skip alerts for intentional simulated disconnects
+      if (sessionData.simulatedDisconnect) {
+        sessionData.simulatedDisconnect = false
+        console.log(`[${lineId}] Simulated disconnect (no alert), reconnecting...`)
+      } else {
+        console.log(`[${lineId}] Disconnected: ${reason}`)
+        // Notify antiban of disconnect (feeds health monitor)
+        try { antiban.onDisconnect?.(reason) } catch {}
+        await notifyCapta(lineId, 'disconnected', { reason })
+      }
 
       const shouldReconnect = reason !== DisconnectReason.loggedOut
       if (shouldReconnect) {
@@ -270,7 +278,7 @@ async function startSession(lineId) {
   const presenceInterval = setInterval(async () => {
     if (sessionData.status !== 'connected') return
     // Skip if outside active hours — go fully unavailable
-    if (!scheduler.isActiveTime()) {
+    if (!isActiveTime()) {
       try { await sock.sendPresenceUpdate('unavailable') } catch {}
       return
     }
@@ -291,12 +299,13 @@ async function startSession(lineId) {
   // This mimics WiFi→mobile handoffs and natural connection resets
   const connectionDropInterval = setInterval(async () => {
     if (sessionData.status !== 'connected') return
-    // Only drop during low-activity hours (late night or random)
-    const hour = new Date().getHours()
+    // Only drop during low-activity hours (Argentina time)
+    const hour = argentinaHour()
     if (hour >= 1 && hour <= 6) {
       // Night: 40% chance of a long "sleep" disconnect (30-90 min)
       if (Math.random() < 0.4) {
         console.log(`[${lineId}] Simulating night sleep disconnect`)
+        sessionData.simulatedDisconnect = true
         try { await sock.ws.close() } catch {}
         // The reconnect handler will pick this up and reconnect after backoff
       }

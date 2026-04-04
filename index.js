@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager, getWarmUpDay, scheduler, variator } from './sessions.js'
+import { sessionManager, getWarmUpDay, isActiveTime, variator } from './sessions.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -36,9 +36,9 @@ app.post('/send', (req, res, next) => {
     return res.status(400).json({ error: 'Session not connected' })
   }
   try {
-    // Block sends outside active hours (anti-ban: no 3 AM messages)
-    if (!scheduler.isActiveTime()) {
-      return res.status(429).json({ error: 'Outside active hours (8-23h). Message queued behavior not available yet.' })
+    // Block sends outside active hours — Argentina timezone (anti-ban: no 3 AM messages)
+    if (!isActiveTime()) {
+      return res.status(429).json({ error: 'Outside active hours (8-23h Argentina). Try again later.' })
     }
 
     const jid = to.replace(/\D/g, '') + '@s.whatsapp.net'
@@ -61,7 +61,6 @@ app.post('/send', (req, res, next) => {
 
     // Simulate typing — but not always (humans sometimes send quick replies)
     // Short messages (<30 chars): 40% chance of no typing indicator
-    // Long messages: always show typing
     const skipTyping = text.length < 30 && Math.random() < 0.4
     if (!skipTyping) {
       try {
@@ -70,6 +69,9 @@ app.post('/send', (req, res, next) => {
         const charMs = 40 + Math.random() * 30
         const typeDuration = Math.max(Math.min(text.length * charMs, 8000), 800) + Math.random() * 1000
         await new Promise(r => setTimeout(r, typeDuration))
+        // Show "paused" briefly before sending (human finishes typing, reviews, then sends)
+        await session.socket.sendPresenceUpdate('paused', jid)
+        await new Promise(r => setTimeout(r, 200 + Math.random() * 600))
       } catch {}
     }
 
