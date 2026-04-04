@@ -159,18 +159,21 @@ export async function notifyCapta(lineId, event, data) {
       }
 
       case 'message': {
-        // Update last_seen on contact
+        // Update last_seen + name on contact
         const { data: msgLine } = await supabase
           .from('lines')
           .select('project_id')
           .eq('id', lineId)
           .single()
         if (msgLine) {
-          await supabase.from('contacts').upsert({
+          const upsertData = {
             project_id: msgLine.project_id,
             phone: data.phone,
             last_seen_at: new Date().toISOString(),
-          }, { onConflict: 'project_id,phone' })
+          }
+          // Save pushName as contact name (update on every message — name can change)
+          if (data.pushName) upsertData.name = data.pushName
+          await supabase.from('contacts').upsert(upsertData, { onConflict: 'project_id,phone' })
         }
         break
       }

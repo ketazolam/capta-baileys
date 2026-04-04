@@ -349,6 +349,13 @@ async function handleMessage(lineId, sock, msg) {
   }
 
   const phone = from.replace('@s.whatsapp.net', '')
+  const pushName = msg.pushName || null // WhatsApp display name of the sender
+
+  // --- Filter: skip invalid phone numbers (LIDs, internal IDs) ---
+  // Real phone numbers are 7-15 digits. WhatsApp LIDs are 15+ digit internal IDs.
+  if (phone.length > 15 || phone.length < 7 || phone.includes('@')) {
+    return
+  }
   const content = msg.message
 
   // --- Mark message as read with human-like patterns ---
@@ -378,6 +385,7 @@ async function handleMessage(lineId, sock, msg) {
       const base64 = buffer.toString('base64')
       await notifyCapta(lineId, 'comprobante', {
         phone,
+        pushName,
         imageBase64: base64,
         mimetype: imageMediaMsg.mimetype || 'image/jpeg',
       })
@@ -390,7 +398,7 @@ async function handleMessage(lineId, sock, msg) {
   // Text message
   const text = content?.conversation || content?.extendedTextMessage?.text
   if (text) {
-    await notifyCapta(lineId, 'message', { phone, text })
+    await notifyCapta(lineId, 'message', { phone, text, pushName })
 
     const contactKey = `${lineId}:${phone}`
     const lastNotified = recentContacts.get(contactKey) || 0
@@ -398,7 +406,7 @@ async function handleMessage(lineId, sock, msg) {
 
     if (isNewContact) {
       recentContacts.set(contactKey, Date.now())
-      await notifyCapta(lineId, 'conversation_start', { phone, text })
+      await notifyCapta(lineId, 'conversation_start', { phone, text, pushName })
       // No auto-reply — human operator handles all outbound communication.
       // Baileys only manages: lead intake, read receipts, presence, anti-ban.
     }
