@@ -87,6 +87,8 @@ export const sessionManager = {
 
   async delete(lineId) {
     const session = sessions.get(lineId)
+    // Cancel any pending reconnect timeout to prevent zombie sessions
+    if (session?.reconnectTimeout) clearTimeout(session.reconnectTimeout)
     if (session?.socket) {
       try { await session.socket.logout() } catch {}
     }
@@ -126,7 +128,7 @@ function getReconnectDelay(attempts) {
   return Math.round(delay + jitter)
 }
 
-async function startSession(lineId) {
+async function startSession(lineId, reconnectAttemptOverride = 0) {
   const sessionPath = path.join(SESSIONS_DIR, lineId)
   if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true })
 
@@ -178,21 +180,22 @@ async function startSession(lineId) {
     savedWarmUpState
   )
 
+  // Create proxy agent per session — each line gets its own sticky residential IP
+  // reconnectAttemptOverride is passed from the reconnect flow to rotate IP on each reconnect
+  const proxyAgent = createProxyAgent(lineId, reconnectAttemptOverride)
+
   const sessionData = {
     status: 'connecting',
     qr: null,
     phone: null,
     socket: null,
     antiban,
+    proxyAgent, // Store for media downloads (must route through same IP as WebSocket)
     reconnectAttempts: 0,
     simulatedDisconnect: false, // Flag to suppress Telegram alerts on intentional drops
   }
   sessions.set(lineId, sessionData)
-
-  // Create proxy agent per session — each line gets its own sticky residential IP
-  const reconnectAttempt = sessions.get(lineId)?.reconnectAttempts || 0
-  const proxyAgent = createProxyAgent(lineId, reconnectAttempt)
-  if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttempt > 0 ? `/r${reconnectAttempt}` : ''})`)
+  if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttemptOverride > 0 ? `/r${reconnectAttemptOverride}` : ''})`)
 
   const sock = makeWASocket({
     version,
@@ -286,7 +289,8 @@ async function startSession(lineId) {
 
         const delay = getReconnectDelay(sessionData.reconnectAttempts)
         console.log(`[${lineId}] Reconnecting in ${Math.round(delay / 1000)}s (attempt ${sessionData.reconnectAttempts})...`)
-        setTimeout(() => startSession(lineId), delay)
+        const attempts = sessionData.reconnectAttempts
+        sessionData.reconnectTimeout = setTimeout(() => startSession(lineId, attempts), delay)
       } else {
         sessions.delete(lineId)
       }
@@ -308,7 +312,7 @@ async function startSession(lineId) {
         continue
       }
 
-      await handleMessage(lineId, sock, msg)
+      await handleMessage(lineId, sock, msg, sessionData.proxyAgent)
     }
   })
 
@@ -386,7 +390,7 @@ async function startSession(lineId) {
   return sessionData
 }
 
-async function handleMessage(lineId, sock, msg) {
+async function handleMessage(lineId, sock, msg, proxyAgent) {
   const from = msg.key.remoteJid
 
   // --- Filter: only handle private 1-on-1 chats ---
@@ -435,7 +439,8 @@ async function handleMessage(lineId, sock, msg) {
   if (imageMediaMsg) {
     console.log(`[${lineId}] Image received from ${phone} — sending to Capta`)
     try {
-      const buffer = await downloadMediaMessage(msg, 'buffer', {}, { reuploadRequest: sock.updateMediaMessage })
+      const dlOpts = proxyAgent ? { options: { httpsAgent: proxyAgent, httpAgent: proxyAgent } } : {}
+      const buffer = await downloadMediaMessage(msg, 'buffer', dlOpts, { reuploadRequest: sock.updateMediaMessage })
       const base64 = buffer.toString('base64')
       await notifyCapta(lineId, 'comprobante', {
         phone,
@@ -458,7 +463,8 @@ async function handleMessage(lineId, sock, msg) {
       const dlDelay = 2000 + Math.random() * 13000 // 2-15s delay
       setTimeout(async () => {
         try {
-          await downloadMediaMessage(msg, 'buffer', {}, { reuploadRequest: sock.updateMediaMessage })
+          const dlOpts = proxyAgent ? { options: { httpsAgent: proxyAgent, httpAgent: proxyAgent } } : {}
+          await downloadMediaMessage(msg, 'buffer', dlOpts, { reuploadRequest: sock.updateMediaMessage })
         } catch {} // Silent fail — non-critical
       }, dlDelay)
     }
