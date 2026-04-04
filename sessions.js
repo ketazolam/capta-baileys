@@ -74,6 +74,17 @@ function randomDelay(min, max) {
   return new Promise(r => setTimeout(r, min + Math.random() * (max - min)))
 }
 
+// Returns the warm-up day (1-based) for a line, or null if warm-up is complete
+function getWarmUpDay(antiban) {
+  try {
+    const state = antiban.exportWarmUpState?.()
+    if (!state?.startDate) return null
+    const daysSinceStart = Math.floor((Date.now() - new Date(state.startDate).getTime()) / (24 * 60 * 60 * 1000)) + 1
+    // warmUpDays is 7, after that warm-up is complete
+    return daysSinceStart <= 7 ? daysSinceStart : null
+  } catch { return null }
+}
+
 function saveWarmUpState(lineId, antiban) {
   if (!antiban) return
   try {
@@ -121,8 +132,8 @@ async function startSession(lineId) {
       },
       warmUp: {
         warmUpDays: 7,
-        day1Limit: 15,
-        growthFactor: 1.5,
+        day1Limit: 8,
+        growthFactor: 2.0,
         inactivityThresholdHours: 72,
       },
       health: {
@@ -306,20 +317,26 @@ async function handleMessage(lineId, sock, antiban, msg) {
           antiban.afterSend(from, greeting)
 
           // --- Step 2: Sales pitch after human pause ---
-          await randomDelay(1500, 3500)
-          await sock.sendPresenceUpdate('composing', from)
-          await randomDelay(2000, 4000)
-          await sock.sendPresenceUpdate('paused', from)
+          // Skip pitch during first 2 warm-up days (no links/promos — Convertix best practice)
+          const warmUpDay = getWarmUpDay(antiban)
+          if (warmUpDay && warmUpDay <= 2) {
+            console.log(`[${lineId}] Warm-up day ${warmUpDay}: skipping pitch (no links/promos)`)
+          } else {
+            await randomDelay(1500, 3500)
+            await sock.sendPresenceUpdate('composing', from)
+            await randomDelay(2000, 4000)
+            await sock.sendPresenceUpdate('paused', from)
 
-          const pitch = generatePitch()
-          const decision2 = await antiban.beforeSend(from, pitch)
-          if (!decision2.allowed) {
-            console.log(`[${lineId}] Antiban blocked pitch: ${decision2.reason}`)
-            return
+            const pitch = generatePitch()
+            const decision2 = await antiban.beforeSend(from, pitch)
+            if (!decision2.allowed) {
+              console.log(`[${lineId}] Antiban blocked pitch: ${decision2.reason}`)
+              return
+            }
+            await randomDelay(decision2.delayMs, decision2.delayMs + 500)
+            await sock.sendMessage(from, { text: pitch })
+            antiban.afterSend(from, pitch)
           }
-          await randomDelay(decision2.delayMs, decision2.delayMs + 500)
-          await sock.sendMessage(from, { text: pitch })
-          antiban.afterSend(from, pitch)
 
           console.log(`[${lineId}] Auto-reply sent to ${phone}`)
         } catch (err) {
