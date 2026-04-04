@@ -16,6 +16,8 @@ export async function sendTelegramAlert(text) {
 }
 
 async function sendTelegram(text) {
+  // DISABLED: Telegram alerts paused to avoid spam
+  return
   const token = process.env.TELEGRAM_BOT_TOKEN
   const chatId = process.env.TELEGRAM_CHAT_ID
   if (!token || !chatId) return

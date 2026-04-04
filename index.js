@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager, getWarmUpDay, isActiveTime, variator } from './sessions.js'
+import { sessionManager, getWarmUpDay, isActiveTime, variator, recentContacts } from './sessions.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -46,10 +46,20 @@ app.post('/send', (req, res, next) => {
     // Apply anti-ban checks before sending
     const antiban = session.antiban
     if (antiban) {
-      // Block link/promo messages during warm-up days 1-2
+      // Warm-up day restrictions (Convertix-aligned: 3-day protocol)
       const warmUpDay = getWarmUpDay(antiban)
-      if (warmUpDay && warmUpDay <= 2 && /https?:\/\/|wa\.me|bit\.ly/i.test(text)) {
-        return res.status(429).json({ error: `Warm-up day ${warmUpDay}: links not allowed yet` })
+      if (warmUpDay) {
+        // During warm-up: only allow replies to contacts who messaged us first
+        // This prevents cold outbound which is the #1 ban trigger for new numbers
+        const phoneNum = to.replace(/\D/g, '')
+        const contactKey = `${lineId}:${phoneNum}`
+        if (!recentContacts.has(contactKey)) {
+          return res.status(429).json({ error: `Warm-up day ${warmUpDay}: can only reply to contacts who messaged first` })
+        }
+        // Block links during warm-up days 1-2
+        if (warmUpDay <= 2 && /https?:\/\/|wa\.me|bit\.ly/i.test(text)) {
+          return res.status(429).json({ error: `Warm-up day ${warmUpDay}: links restricted` })
+        }
       }
 
       const decision = await antiban.beforeSend(jid, text)

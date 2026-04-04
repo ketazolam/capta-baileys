@@ -19,6 +19,7 @@
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "openai": "^4.91.1",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "socks-proxy-agent": "^10.0.0"
   }
 }

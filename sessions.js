@@ -7,13 +7,24 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import { AntiBan, ContentVariator } from 'baileys-antiban'
+import { SocksProxyAgent } from 'socks-proxy-agent'
 import path from 'path'
 import fs from 'fs'
 import { notifyCapta, sendTelegramAlert } from './notify.js'
 
+// Residential proxy — routes WhatsApp WebSocket through residential IP
+// Set PROXY_URL env var to enable: socks5://user:pass@host:port
+const PROXY_URL = process.env.PROXY_URL || null
+function createProxyAgent() {
+  if (!PROXY_URL) return undefined
+  return new SocksProxyAgent(PROXY_URL)
+}
+
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
 const MAX_MESSAGE_AGE_SECONDS = 60 // Ignore messages older than 60s (stale on reconnect)
-const recentContacts = new Map()
+// Tracks contacts who messaged us (lineId:phone → timestamp)
+// Exported so /send can verify we're replying, not cold-outbounding
+export const recentContacts = new Map()
 
 // Get current hour in Argentina timezone (UTC-3), works regardless of server TZ
 function argentinaHour() {
@@ -83,8 +94,8 @@ export function getWarmUpDay(antiban) {
     const state = antiban.exportWarmUpState?.()
     if (!state?.startDate) return null
     const daysSinceStart = Math.floor((Date.now() - new Date(state.startDate).getTime()) / (24 * 60 * 60 * 1000)) + 1
-    // warmUpDays is 7, after that warm-up is complete
-    return daysSinceStart <= 7 ? daysSinceStart : null
+    // warmUpDays is 3 (phone warm-up should be done before QR scan)
+    return daysSinceStart <= 3 ? daysSinceStart : null
   } catch { return null }
 }
 
@@ -134,9 +145,9 @@ async function startSession(lineId) {
         identicalMessageWindowMs: 3600000, // re-enable: 1 hour window
       },
       warmUp: {
-        warmUpDays: 7,
-        day1Limit: 8,
-        growthFactor: 2.0,
+        warmUpDays: 3,           // Match Convertix: 3-day warm-up (phone warm-up already done before QR scan)
+        day1Limit: 15,           // Day 1 on Baileys = Day 3+ of phone warm-up, so higher limit
+        growthFactor: 2.5,       // Ramp faster: 15 → 37 → 93
         inactivityThresholdHours: 72,
       },
       health: {
@@ -168,9 +179,16 @@ async function startSession(lineId) {
   }
   sessions.set(lineId, sessionData)
 
+  // Create proxy agent per session (each session gets its own agent instance)
+  const proxyAgent = createProxyAgent()
+  if (proxyAgent) console.log(`[${lineId}] Using residential proxy: ${PROXY_URL.replace(/\/\/.*@/, '//***@')}`)
+
   const sock = makeWASocket({
     version,
     auth: state,
+    // --- Residential proxy: route WebSocket + fetches through residential IP ---
+    agent: proxyAgent,
+    fetchAgent: proxyAgent,
     // Anti-fingerprint: identify as real WhatsApp Web client, not Baileys
     browser: Browsers.ubuntu('Chrome'),
     // Don't mark online immediately — avoids automated "always online" pattern
