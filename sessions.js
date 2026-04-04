@@ -7,17 +7,17 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import { AntiBan, ContentVariator } from 'baileys-antiban'
-import { SocksProxyAgent } from 'socks-proxy-agent'
+import { HttpsProxyAgent } from 'https-proxy-agent'
 import path from 'path'
 import fs from 'fs'
 import { notifyCapta, sendTelegramAlert } from './notify.js'
 
 // Residential proxy — routes WhatsApp WebSocket through residential IP
-// Set PROXY_URL env var to enable: socks5://user:pass@host:port
+// Set PROXY_URL env var: http://user:pass@host:port
 const PROXY_URL = process.env.PROXY_URL || null
 function createProxyAgent() {
   if (!PROXY_URL) return undefined
-  return new SocksProxyAgent(PROXY_URL)
+  return new HttpsProxyAgent(PROXY_URL)
 }
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
