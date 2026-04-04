@@ -62,6 +62,12 @@ export function isActiveTime() {
   return hour >= 8 && hour < 23
 }
 
+// Sending hours — tighter window for outbound messages (avoid early morning/late night sends)
+export function isSendingTime() {
+  const hour = argentinaHour()
+  return hour >= 10 && hour < 21
+}
+
 // --- Cleanup recentContacts every hour (prevent unbounded memory growth) ---
 setInterval(() => {
   const now = Date.now()
@@ -106,8 +112,8 @@ export function getWarmUpDay(antiban) {
     const state = antiban.exportWarmUpState?.()
     if (!state?.startDate) return null
     const daysSinceStart = Math.floor((Date.now() - new Date(state.startDate).getTime()) / (24 * 60 * 60 * 1000)) + 1
-    // warmUpDays is 3 (phone warm-up should be done before QR scan)
-    return daysSinceStart <= 3 ? daysSinceStart : null
+    // 7-day warm-up — research consensus: 7-14 days for best survival
+    return daysSinceStart <= 7 ? daysSinceStart : null
   } catch { return null }
 }
 
@@ -149,19 +155,19 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
   const antiban = new AntiBan(
     {
       rateLimiter: {
-        maxPerMinute: 5,
-        maxPerHour: 60,
-        maxPerDay: 400,
-        minDelayMs: 2000,
-        maxDelayMs: 7000,
-        newChatDelayMs: 4000,
-        burstAllowance: 2,
-        identicalMessageWindowMs: 3600000, // re-enable: 1 hour window
+        maxPerMinute: 3,           // Conservative (was 5) — Whapi.Cloud recommends 2/min
+        maxPerHour: 40,            // Was 60 — reduce peak hourly rate
+        maxPerDay: 300,            // Was 400 — lower daily ceiling
+        minDelayMs: 3000,          // Was 2000 — more time between messages
+        maxDelayMs: 10000,         // Was 7000 — more varied delays
+        newChatDelayMs: 8000,      // Was 4000 — longer delay for new conversations
+        burstAllowance: 1,         // Was 2 — less burst tolerance
+        identicalMessageWindowMs: 3600000,
       },
       warmUp: {
-        warmUpDays: 3,           // Match Convertix: 3-day warm-up (phone warm-up already done before QR scan)
-        day1Limit: 15,           // Day 1 on Baileys = Day 3+ of phone warm-up, so higher limit
-        growthFactor: 2.5,       // Ramp faster: 15 → 37 → 93
+        warmUpDays: 7,             // Research consensus: 7-14 days (was 3)
+        day1Limit: 10,             // Conservative start (was 15)
+        growthFactor: 1.8,         // Standard curve: 10→18→32→58→104→187→337 (was 2.5)
         inactivityThresholdHours: 72,
       },
       health: {
@@ -380,7 +386,7 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
   // Send to self-chat (own JID) — completely safe, no external recipient.
   const selfChatMessages = ['\u{1f4cc}', '\u{2705}', '\u{1f44d}', '\u{1f517}', 'ok', '..', 'listo', 'ver']
   const selfChatInterval = setInterval(async () => {
-    if (sessionData.status !== 'connected' || !isActiveTime()) return
+    if (sessionData.status !== 'connected' || !isSendingTime()) return
     if (Math.random() > 0.15) return // ~15% chance per 2h cycle = ~2-3 per day
     if (!sessionData.phone) return
     try {
