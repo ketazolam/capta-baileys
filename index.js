@@ -13,6 +13,29 @@ const dailyNewContacts = new Map()
 
 app.get('/health', (_, res) => res.json({ ok: true, sessions: sessionManager.count() }))
 
+// Proxy diagnostic endpoint
+app.get('/proxy-check', async (req, res) => {
+  const secret = process.env.INTERNAL_SECRET
+  if (secret && req.headers['x-internal-secret'] !== secret) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  const proxyUrl = process.env.PROXY_URL
+  if (!proxyUrl) return res.json({ configured: false })
+
+  try {
+    const { HttpsProxyAgent } = await import('https-proxy-agent')
+    const agent = new HttpsProxyAgent(proxyUrl)
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 10000)
+    const r = await fetch('https://api.ipify.org?format=json', { agent, signal: controller.signal })
+    clearTimeout(timeout)
+    const json = await r.json()
+    res.json({ configured: true, working: true, proxyIp: json.ip })
+  } catch (err) {
+    res.json({ configured: true, working: false, error: err.message })
+  }
+})
+
 // Auth middleware for /lines routes
 app.use('/lines', (req, res, next) => {
   const secret = process.env.INTERNAL_SECRET
