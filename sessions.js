@@ -193,7 +193,7 @@ function getReconnectDelay(attempts) {
   return Math.round(delay + jitter)
 }
 
-async function startSession(lineId, reconnectAttemptOverride = 0) {
+async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = false) {
   const sessionPath = path.join(SESSIONS_DIR, lineId)
   if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true })
 
@@ -247,7 +247,8 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
 
   // Create proxy agent per session — each line gets its own sticky residential IP
   // reconnectAttemptOverride is passed from the reconnect flow to rotate IP on each reconnect
-  const proxyAgent = createProxyAgent(lineId, reconnectAttemptOverride)
+  const proxyAgent = skipProxy ? undefined : createProxyAgent(lineId, reconnectAttemptOverride)
+  if (skipProxy) console.log(`[${lineId}] Starting WITHOUT proxy (fallback mode)`)
 
   const sessionData = {
     status: 'connecting',
@@ -297,6 +298,26 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
   })
 
   sessionData.socket = sock
+
+  // Connection timeout: if no QR and no connection after 20s, retry without proxy
+  if (proxyAgent) {
+    sessionData._connectTimeout = setTimeout(() => {
+      if (sessionData.status === 'connecting' && !sessionData.qr) {
+        console.log(`[${lineId}] Connection timeout with proxy — retrying WITHOUT proxy`)
+        try { sock.end() } catch {}
+        sessions.delete(lineId)
+        startSession(lineId, reconnectAttemptOverride, true)
+      }
+    }, 20000)
+  }
+
+  // Clear connection timeout once QR or connection is established
+  sock.ev.on('connection.update', ({ connection, qr: qrCode }) => {
+    if ((qrCode || connection === 'open') && sessionData._connectTimeout) {
+      clearTimeout(sessionData._connectTimeout)
+      sessionData._connectTimeout = null
+    }
+  })
 
   // Persist warm-up state every 5 minutes
   const warmUpPersistInterval = setInterval(() => saveWarmUpState(lineId, antiban), 5 * 60 * 1000)
