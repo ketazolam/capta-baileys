@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { sessionManager, getWarmUpDay } from '../sessions.js'
+import { sessionManager, getWarmUpDay, getResponseRate } from '../sessions.js'
 import QRCode from 'qrcode'
 
 const router = Router()
@@ -57,6 +57,7 @@ router.get('/:lineId/health', (req, res) => {
     const health = antiban.getHealthStatus?.() || {}
     const warmUpDay = getWarmUpDay(antiban)
     const warmUpState = antiban.exportWarmUpState?.() || {}
+    const responseRate = getResponseRate(lineId)
     res.json({
       risk: health.risk || 'unknown',
       score: health.score ?? null,
@@ -64,6 +65,9 @@ router.get('/:lineId/health', (req, res) => {
       warmUpDay,
       warmUpStartDate: warmUpState.startDate || null,
       messagestoday: warmUpState.messagesToday ?? null,
+      responseRate: Math.round(responseRate.rate * 100),
+      sent24h: responseRate.sent,
+      received24h: responseRate.received,
     })
   } catch (err) {
     res.status(500).json({ error: err.message })

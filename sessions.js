@@ -31,10 +31,40 @@ function createProxyAgent(lineId, reconnectAttempt = 0) {
 }
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
-const MAX_MESSAGE_AGE_SECONDS = 60 // Ignore messages older than 60s (stale on reconnect)
+const MAX_MESSAGE_AGE_SECONDS = 300 // Ignore messages older than 5min (covers reconnect delays without losing leads)
 // Tracks contacts who messaged us (lineId:phone → timestamp)
 // Exported so /send can verify we're replying, not cold-outbounding
 export const recentContacts = new Map()
+
+// --- Response rate tracker: rolling 24h sent/received per line ---
+// If response rate drops below 50%, it means the number is mostly sending without
+// receiving — a classic spam pattern that triggers bans.
+const responseRateTracker = new Map() // lineId → { sent: [{ts}], received: [{ts}] }
+
+export function trackSent(lineId) {
+  const tracker = responseRateTracker.get(lineId) || { sent: [], received: [] }
+  tracker.sent.push(Date.now())
+  responseRateTracker.set(lineId, tracker)
+}
+
+export function trackReceived(lineId) {
+  const tracker = responseRateTracker.get(lineId) || { sent: [], received: [] }
+  tracker.received.push(Date.now())
+  responseRateTracker.set(lineId, tracker)
+}
+
+export function getResponseRate(lineId) {
+  const tracker = responseRateTracker.get(lineId)
+  if (!tracker) return { rate: 1, sent: 0, received: 0 }
+  const cutoff = Date.now() - TWENTY_FOUR_HOURS
+  tracker.sent = tracker.sent.filter(ts => ts > cutoff)
+  tracker.received = tracker.received.filter(ts => ts > cutoff)
+  responseRateTracker.set(lineId, tracker)
+  const sent = tracker.sent.length
+  const received = tracker.received.length
+  if (sent === 0) return { rate: 1, sent, received }
+  return { rate: received / sent, sent, received }
+}
 
 // Get current hour in Argentina timezone (UTC-3), works regardless of server TZ
 function argentinaHour() {
@@ -47,10 +77,10 @@ if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true }
 // Map of lineId -> { socket, qr, status, phone, antiban, reconnectAttempts }
 const sessions = new Map()
 
-// Content variator: makes each outbound message technically unique (zero-width chars)
-// Applied in /send endpoint so human's copy-pasted pitches are never identical
+// Content variator: makes each outbound message slightly different
+// DISABLED zeroWidthChars: WhatsApp ML can detect invisible unicode patterns
 export const variator = new ContentVariator({
-  zeroWidthChars: true,
+  zeroWidthChars: false,
   punctuationVariation: true,
   emojiPadding: false,
   synonyms: false,
@@ -65,14 +95,23 @@ export function isActiveTime() {
 // Sending hours — tighter window for outbound messages (avoid early morning/late night sends)
 export function isSendingTime() {
   const hour = argentinaHour()
-  return hour >= 10 && hour < 21
+  return hour >= 10 && hour < 18 // 8h window (GREEN-API: max 8h/day sending)
 }
 
-// --- Cleanup recentContacts every hour (prevent unbounded memory growth) ---
+// --- Cleanup recentContacts + responseRateTracker every hour (prevent memory growth) ---
 setInterval(() => {
   const now = Date.now()
   for (const [key, ts] of recentContacts) {
     if (now - ts > TWENTY_FOUR_HOURS) recentContacts.delete(key)
+  }
+  // Prune old entries from response rate tracker
+  const cutoff = now - TWENTY_FOUR_HOURS
+  for (const [lineId, tracker] of responseRateTracker) {
+    tracker.sent = tracker.sent.filter(ts => ts > cutoff)
+    tracker.received = tracker.received.filter(ts => ts > cutoff)
+    if (tracker.sent.length === 0 && tracker.received.length === 0) {
+      responseRateTracker.delete(lineId)
+    }
   }
 }, 60 * 60 * 1000)
 
@@ -112,8 +151,8 @@ export function getWarmUpDay(antiban) {
     const state = antiban.exportWarmUpState?.()
     if (!state?.startDate) return null
     const daysSinceStart = Math.floor((Date.now() - new Date(state.startDate).getTime()) / (24 * 60 * 60 * 1000)) + 1
-    // 7-day warm-up — research consensus: 7-14 days for best survival
-    return daysSinceStart <= 7 ? daysSinceStart : null
+    // 10-day warm-up — GREEN-API: 10 days minimum for number survival
+    return daysSinceStart <= 10 ? daysSinceStart : null
   } catch { return null }
 }
 
@@ -155,19 +194,19 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
   const antiban = new AntiBan(
     {
       rateLimiter: {
-        maxPerMinute: 3,           // Conservative (was 5) — Whapi.Cloud recommends 2/min
-        maxPerHour: 40,            // Was 60 — reduce peak hourly rate
-        maxPerDay: 300,            // Was 400 — lower daily ceiling
-        minDelayMs: 3000,          // Was 2000 — more time between messages
-        maxDelayMs: 10000,         // Was 7000 — more varied delays
-        newChatDelayMs: 8000,      // Was 4000 — longer delay for new conversations
-        burstAllowance: 1,         // Was 2 — less burst tolerance
+        maxPerMinute: 2,           // GREEN-API: max 1/min, 2 is compromise
+        maxPerHour: 25,            // Reduce peak hourly rate
+        maxPerDay: 200,            // GREEN-API consensus: max 200/day
+        minDelayMs: 4000,          // More separation between messages
+        maxDelayMs: 12000,         // More varied delays
+        newChatDelayMs: 10000,     // Longer delay for new conversations
+        burstAllowance: 1,
         identicalMessageWindowMs: 3600000,
       },
       warmUp: {
-        warmUpDays: 7,             // Research consensus: 7-14 days (was 3)
-        day1Limit: 10,             // Conservative start (was 15)
-        growthFactor: 1.8,         // Standard curve: 10→18→32→58→104→187→337 (was 2.5)
+        warmUpDays: 10,            // GREEN-API: 10 days minimum
+        day1Limit: 10,
+        growthFactor: 1.6,         // Smooth ramp: 10→16→26→41→66→105→169→270 (capped at 200)
         inactivityThresholdHours: 72,
       },
       health: {
@@ -232,7 +271,7 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
     options: {
       headers: {
         'Accept-Language': 'es-AR,es;q=0.9,en;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
       },
     },
     logger: (() => { const l = { level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {} }; l.child = () => l; return l })(),
@@ -323,6 +362,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
         continue
       }
 
+      // Track incoming message for response rate monitoring
+      trackReceived(lineId)
+
       await handleMessage(lineId, sock, msg, sessionData.proxyAgent)
     }
   })
@@ -366,7 +408,7 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
         if (Math.random() < 0.4) {
           console.log(`[${lineId}] Simulating night sleep disconnect`)
           sessionData.simulatedDisconnect = true
-          try { await sock.ws.close() } catch {}
+          try { sock.end(new Boom('Simulated sleep', { statusCode: DisconnectReason.connectionLost })) } catch {}
           return // Don't reschedule — reconnect flow will create new session
         }
       } else {
@@ -384,24 +426,31 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
   // --- Self-chat outbound seeding: add outbound traffic to look like a real user ---
   // A number that only receives and never sends is statistically anomalous.
   // Send to self-chat (own JID) — completely safe, no external recipient.
+  // Variable interval (not fixed setInterval) — same pattern as presence/connection drops.
   const selfChatMessages = ['\u{1f4cc}', '\u{2705}', '\u{1f44d}', '\u{1f517}', 'ok', '..', 'listo', 'ver']
-  const selfChatInterval = setInterval(async () => {
-    if (sessionData.status !== 'connected' || !isSendingTime()) return
-    if (Math.random() > 0.15) return // ~15% chance per 2h cycle = ~2-3 per day
-    if (!sessionData.phone) return
-    try {
-      const selfJid = `${sessionData.phone}@s.whatsapp.net`
-      const selfMsg = selfChatMessages[Math.floor(Math.random() * selfChatMessages.length)]
-      await sock.sendMessage(selfJid, { text: selfMsg })
-    } catch {}
-  }, 2 * 60 * 60 * 1000) // Check every 2 hours
+  let selfChatTimer = null
+  function scheduleSelfChat() {
+    const nextDelay = (1.5 + Math.random() * 4.5) * 60 * 60 * 1000 // 1.5-6 hours, different each time
+    selfChatTimer = setTimeout(async () => {
+      if (sessionData.status !== 'connected' || !isSendingTime()) { scheduleSelfChat(); return }
+      if (Math.random() > 0.3) { scheduleSelfChat(); return } // ~30% chance = ~2-3 per day
+      if (!sessionData.phone) { scheduleSelfChat(); return }
+      try {
+        const selfJid = `${sessionData.phone}@s.whatsapp.net`
+        const selfMsg = selfChatMessages[Math.floor(Math.random() * selfChatMessages.length)]
+        await sock.sendMessage(selfJid, { text: selfMsg })
+      } catch {}
+      scheduleSelfChat()
+    }, nextDelay)
+  }
+  scheduleSelfChat()
 
-  // Clean up intervals on disconnect
+  // Clean up timers on disconnect
   sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'close') {
       clearTimeout(presenceTimer)
       clearTimeout(connectionDropTimer)
-      clearInterval(selfChatInterval)
+      clearTimeout(selfChatTimer)
     }
   })
 
@@ -434,6 +483,13 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
   }
   const content = msg.message
 
+  // Register contact as "messaged us" for ALL message types (text, image, audio, etc.)
+  // Critical: without this, image-first leads can't be replied to during warm-up
+  const contactKey = `${lineId}:${phone}`
+  const lastNotified = recentContacts.get(contactKey) || 0
+  const isNewContact = Date.now() - lastNotified > TWENTY_FOUR_HOURS
+  recentContacts.set(contactKey, Date.now())
+
   // --- Mark message as read with human-like patterns ---
   // Not every message gets read immediately — 15% are "ignored" (read much later or never)
   const readChance = Math.random()
@@ -456,6 +512,10 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
   const imageMediaMsg = imageMsg || (docMsg?.mimetype?.startsWith('image/') ? docMsg : null)
   if (imageMediaMsg) {
     console.log(`[${lineId}] Image received from ${phone} — sending to Capta`)
+    // Fire conversation_start for image-first leads (analytics funnel)
+    if (isNewContact) {
+      await notifyCapta(lineId, 'conversation_start', { phone, text: '[imagen]', pushName })
+    }
     try {
       const dlOpts = proxyAgent ? { options: { httpsAgent: proxyAgent, httpAgent: proxyAgent } } : {}
       const buffer = await downloadMediaMessage(msg, 'buffer', dlOpts, { reuploadRequest: sock.updateMediaMessage })
@@ -495,15 +555,8 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
   if (text) {
     await notifyCapta(lineId, 'message', { phone, text, pushName })
 
-    const contactKey = `${lineId}:${phone}`
-    const lastNotified = recentContacts.get(contactKey) || 0
-    const isNewContact = Date.now() - lastNotified > TWENTY_FOUR_HOURS
-
     if (isNewContact) {
-      recentContacts.set(contactKey, Date.now())
       await notifyCapta(lineId, 'conversation_start', { phone, text, pushName })
-      // No auto-reply — human operator handles all outbound communication.
-      // Baileys only manages: lead intake, read receipts, presence, anti-ban.
     }
   }
 }

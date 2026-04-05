@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager, getWarmUpDay, isSendingTime, variator, recentContacts } from './sessions.js'
+import { sessionManager, getWarmUpDay, isSendingTime, variator, recentContacts, trackSent, getResponseRate } from './sessions.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -39,20 +39,21 @@ app.post('/send', (req, res, next) => {
     return res.status(400).json({ error: 'Session not connected' })
   }
   try {
-    // Block sends outside sending hours — tighter than reception window
-    if (!isSendingTime()) {
-      return res.status(429).json({ error: 'Outside sending hours (10-21h Argentina). Try again later.' })
-    }
-
     const jid = to.replace(/\D/g, '') + '@s.whatsapp.net'
     const phoneNum = to.replace(/\D/g, '')
     const contactKey = `${lineId}:${phoneNum}`
     const isReply = recentContacts.has(contactKey)
 
+    // Block cold outbound outside sending hours (10-18h) — but ALWAYS allow replies
+    // Replies are safe: WhatsApp never penalizes responding to someone who messaged first
+    if (!isReply && !isSendingTime()) {
+      return res.status(429).json({ error: 'Outside sending hours (10-18h Argentina). Only replies allowed.' })
+    }
+
     // Apply anti-ban checks before sending
     const antiban = session.antiban
     if (antiban) {
-      // Warm-up restrictions (7-day protocol)
+      // Warm-up restrictions (10-day protocol)
       const warmUpDay = getWarmUpDay(antiban)
       if (warmUpDay) {
         // Days 1-5: reply-only (no cold outbound to unknown contacts)
@@ -70,8 +71,7 @@ app.post('/send', (req, res, next) => {
         const today = new Date().toISOString().slice(0, 10)
         const tracker = dailyNewContacts.get(lineId) || { date: today, count: 0 }
         if (tracker.date !== today) { tracker.date = today; tracker.count = 0 }
-        const warmUpDay = getWarmUpDay(antiban)
-        const maxNew = warmUpDay ? Math.min(warmUpDay * 5, 20) : 30
+        const maxNew = warmUpDay ? Math.min(warmUpDay * 3, 20) : 20
         if (tracker.count >= maxNew) {
           return res.status(429).json({ error: `Daily new contact limit reached (${maxNew}). Only replies allowed.` })
         }
@@ -84,6 +84,15 @@ app.post('/send', (req, res, next) => {
         return res.status(429).json({ error: `Antiban: ${decision.reason}` })
       }
       await new Promise(r => setTimeout(r, decision.delayMs || 1500))
+    }
+
+    // Response rate check: if sending way more than receiving, pause outbound
+    // A number that only sends without receiving replies is a spam signature
+    if (!isReply) {
+      const { rate, sent } = getResponseRate(lineId)
+      if (sent >= 10 && rate < 0.5) {
+        return res.status(429).json({ error: `Response rate too low (${Math.round(rate * 100)}%). Need 50%+ to continue cold outbound.` })
+      }
     }
 
     // Simulate typing — but not always (humans sometimes send quick replies)
@@ -102,11 +111,12 @@ app.post('/send', (req, res, next) => {
       } catch {}
     }
 
-    // Apply content variation — zero-width chars make each send technically unique
+    // Apply content variation — punctuation variation makes each send slightly different
     const variedText = variator.vary(text)
     await session.socket.sendMessage(jid, { text: variedText })
 
     if (antiban) antiban.afterSend(jid, text)
+    trackSent(lineId)
     res.json({ ok: true })
   } catch (err) {
     try { session.antiban?.afterSendFailed?.(err.message) } catch {}
