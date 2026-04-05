@@ -176,7 +176,7 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         inactivityThresholdHours: 720,
       },
       health: {
-        autoPauseAt: 'high',
+        autoPauseAt: 'none',  // Inbound-only: never auto-pause replies
         onRiskChange: (status) => {
           console.log(`[${lineId}] Health: ${status.risk} (score: ${status.score}) — ${status.recommendation || ''}`)
           // Alert on medium/high risk escalation via Telegram
