@@ -14,7 +14,10 @@ import { notifyCapta, sendTelegramAlert } from './notify.js'
 
 // Residential proxy — routes WhatsApp WebSocket through residential IP
 // Set PROXY_URL env var: http://user:pass@host:port
-const PROXY_URL = process.env.PROXY_URL || null
+// TEMPORARILY DISABLED: proxy WebSocket to WhatsApp fails (timeout/500).
+// HTTP works but WS doesn't — likely IPRoyal returning datacenter IPs.
+// TODO: re-enable once proxy provider is verified working for WebSocket.
+const PROXY_URL = null // process.env.PROXY_URL || null
 function createProxyAgent(lineId, reconnectAttempt = 0) {
   if (!PROXY_URL) return undefined
   try {
