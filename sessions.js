@@ -128,20 +128,21 @@ export const sessionManager = {
   async create(lineId) {
     const existing = sessions.get(lineId)
     if (existing) {
-      // If session is stuck in "connecting" for >30s with no QR, tear it down and restart
-      if (existing.status === 'connecting' && !existing.qr) {
-        const age = Date.now() - (existing._createdAt || 0)
-        if (age > 30000) {
-          console.log(`[${lineId}] Cleaning up stuck session (${Math.round(age / 1000)}s old)`)
-          if (existing.reconnectTimeout) clearTimeout(existing.reconnectTimeout)
-          try { existing.socket?.end() } catch {}
-          sessions.delete(lineId)
-          // Fall through to startSession below
-        } else {
-          return existing
-        }
-      } else {
+      // Connected or has QR ready — return as-is
+      if (existing.status === 'connected' || existing.status === 'waiting_qr') {
         return existing
+      }
+      // Session is in a non-ready state (connecting, disconnected, etc.)
+      // If it's been >15s without producing a QR, tear it down and restart fresh
+      const age = Date.now() - (existing._createdAt || 0)
+      if (age > 15000) {
+        console.log(`[${lineId}] Cleaning up stale session (status: ${existing.status}, ${Math.round(age / 1000)}s old)`)
+        if (existing.reconnectTimeout) clearTimeout(existing.reconnectTimeout)
+        try { existing.socket?.end() } catch {}
+        sessions.delete(lineId)
+        // Fall through to startSession below
+      } else {
+        return existing // Give it more time
       }
     }
     return await startSession(lineId)
