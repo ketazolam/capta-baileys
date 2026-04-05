@@ -126,7 +126,24 @@ export const sessionManager = {
   })),
 
   async create(lineId) {
-    if (sessions.has(lineId)) return sessions.get(lineId)
+    const existing = sessions.get(lineId)
+    if (existing) {
+      // If session is stuck in "connecting" for >30s with no QR, tear it down and restart
+      if (existing.status === 'connecting' && !existing.qr) {
+        const age = Date.now() - (existing._createdAt || 0)
+        if (age > 30000) {
+          console.log(`[${lineId}] Cleaning up stuck session (${Math.round(age / 1000)}s old)`)
+          if (existing.reconnectTimeout) clearTimeout(existing.reconnectTimeout)
+          try { existing.socket?.end() } catch {}
+          sessions.delete(lineId)
+          // Fall through to startSession below
+        } else {
+          return existing
+        }
+      } else {
+        return existing
+      }
+    }
     return await startSession(lineId)
   },
 
@@ -240,6 +257,7 @@ async function startSession(lineId, reconnectAttemptOverride = 0) {
     proxyAgent, // Store for media downloads (must route through same IP as WebSocket)
     reconnectAttempts: 0,
     simulatedDisconnect: false, // Flag to suppress Telegram alerts on intentional drops
+    _createdAt: Date.now(),
   }
   sessions.set(lineId, sessionData)
   if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttemptOverride > 0 ? `/r${reconnectAttemptOverride}` : ''})`)
