@@ -6,7 +6,7 @@ import makeWASocket, {
   Browsers,
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
-import { AntiBan, ContentVariator } from 'baileys-antiban'
+import { AntiBan } from 'baileys-antiban'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import path from 'path'
 import fs from 'fs'
@@ -36,38 +36,7 @@ function createProxyAgent(lineId, reconnectAttempt = 0) {
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
 const MAX_MESSAGE_AGE_SECONDS = 300 // Ignore messages older than 5min (covers reconnect delays without losing leads)
 // Tracks contacts who messaged us (lineId:phone → timestamp)
-// Exported so /send can verify we're replying, not cold-outbounding
 export const recentContacts = new Map()
-
-// --- Response rate tracker: rolling 24h sent/received per line ---
-// If response rate drops below 50%, it means the number is mostly sending without
-// receiving — a classic spam pattern that triggers bans.
-const responseRateTracker = new Map() // lineId → { sent: [{ts}], received: [{ts}] }
-
-export function trackSent(lineId) {
-  const tracker = responseRateTracker.get(lineId) || { sent: [], received: [] }
-  tracker.sent.push(Date.now())
-  responseRateTracker.set(lineId, tracker)
-}
-
-export function trackReceived(lineId) {
-  const tracker = responseRateTracker.get(lineId) || { sent: [], received: [] }
-  tracker.received.push(Date.now())
-  responseRateTracker.set(lineId, tracker)
-}
-
-export function getResponseRate(lineId) {
-  const tracker = responseRateTracker.get(lineId)
-  if (!tracker) return { rate: 1, sent: 0, received: 0 }
-  const cutoff = Date.now() - TWENTY_FOUR_HOURS
-  tracker.sent = tracker.sent.filter(ts => ts > cutoff)
-  tracker.received = tracker.received.filter(ts => ts > cutoff)
-  responseRateTracker.set(lineId, tracker)
-  const sent = tracker.sent.length
-  const received = tracker.received.length
-  if (sent === 0) return { rate: 1, sent, received }
-  return { rate: received / sent, sent, received }
-}
 
 // Get current hour in Argentina timezone (UTC-3), works regardless of server TZ
 function argentinaHour() {
@@ -80,41 +49,17 @@ if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true }
 // Map of lineId -> { socket, qr, status, phone, antiban, reconnectAttempts }
 const sessions = new Map()
 
-// Content variator: makes each outbound message slightly different
-// DISABLED zeroWidthChars: WhatsApp ML can detect invisible unicode patterns
-export const variator = new ContentVariator({
-  zeroWidthChars: false,
-  punctuationVariation: true,
-  emojiPadding: false,
-  synonyms: false,
-})
-
 // Active hours check using Argentina timezone (NOT Scheduler — it uses server TZ which is UTC on Railway)
 export function isActiveTime() {
   const hour = argentinaHour()
   return hour >= 8 && hour < 23
 }
 
-// Sending hours — tighter window for outbound messages (avoid early morning/late night sends)
-export function isSendingTime() {
-  const hour = argentinaHour()
-  return hour >= 10 && hour < 18 // 8h window (GREEN-API: max 8h/day sending)
-}
-
-// --- Cleanup recentContacts + responseRateTracker every hour (prevent memory growth) ---
+// --- Cleanup recentContacts every hour (prevent memory growth) ---
 setInterval(() => {
   const now = Date.now()
   for (const [key, ts] of recentContacts) {
     if (now - ts > TWENTY_FOUR_HOURS) recentContacts.delete(key)
-  }
-  // Prune old entries from response rate tracker
-  const cutoff = now - TWENTY_FOUR_HOURS
-  for (const [lineId, tracker] of responseRateTracker) {
-    tracker.sent = tracker.sent.filter(ts => ts > cutoff)
-    tracker.received = tracker.received.filter(ts => ts > cutoff)
-    if (tracker.sent.length === 0 && tracker.received.length === 0) {
-      responseRateTracker.delete(lineId)
-    }
   }
 }, 60 * 60 * 1000)
 
@@ -215,20 +160,20 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
   const antiban = new AntiBan(
     {
       rateLimiter: {
-        maxPerMinute: 2,           // GREEN-API: max 1/min, 2 is compromise
-        maxPerHour: 25,            // Reduce peak hourly rate
-        maxPerDay: 200,            // GREEN-API consensus: max 200/day
-        minDelayMs: 4000,          // More separation between messages
-        maxDelayMs: 12000,         // More varied delays
-        newChatDelayMs: 10000,     // Longer delay for new conversations
-        burstAllowance: 1,
-        identicalMessageWindowMs: 3600000,
+        maxPerMinute: 10,          // Inbound-only: replies only, relaxed limits
+        maxPerHour: 100,
+        maxPerDay: 1000,
+        minDelayMs: 1000,
+        maxDelayMs: 3000,
+        newChatDelayMs: 2000,
+        burstAllowance: 5,
+        identicalMessageWindowMs: 60000,
       },
       warmUp: {
-        warmUpDays: 10,            // GREEN-API: 10 days minimum
-        day1Limit: 10,
-        growthFactor: 1.6,         // Smooth ramp: 10→16→26→41→66→105→169→270 (capped at 200)
-        inactivityThresholdHours: 72,
+        warmUpDays: 1,             // Inbound-only: no real warm-up needed
+        day1Limit: 1000,
+        growthFactor: 1,
+        inactivityThresholdHours: 720,
       },
       health: {
         autoPauseAt: 'high',
@@ -417,9 +362,6 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         continue
       }
 
-      // Track incoming message for response rate monitoring
-      trackReceived(lineId)
-
       await handleMessage(lineId, sock, msg, sessionData.proxyAgent)
     }
   })
@@ -478,34 +420,11 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
   }
   scheduleConnectionDrop()
 
-  // --- Self-chat outbound seeding: add outbound traffic to look like a real user ---
-  // A number that only receives and never sends is statistically anomalous.
-  // Send to self-chat (own JID) — completely safe, no external recipient.
-  // Variable interval (not fixed setInterval) — same pattern as presence/connection drops.
-  const selfChatMessages = ['\u{1f4cc}', '\u{2705}', '\u{1f44d}', '\u{1f517}', 'ok', '..', 'listo', 'ver']
-  let selfChatTimer = null
-  function scheduleSelfChat() {
-    const nextDelay = (1.5 + Math.random() * 4.5) * 60 * 60 * 1000 // 1.5-6 hours, different each time
-    selfChatTimer = setTimeout(async () => {
-      if (sessionData.status !== 'connected' || !isSendingTime()) { scheduleSelfChat(); return }
-      if (Math.random() > 0.3) { scheduleSelfChat(); return } // ~30% chance = ~2-3 per day
-      if (!sessionData.phone) { scheduleSelfChat(); return }
-      try {
-        const selfJid = `${sessionData.phone}@s.whatsapp.net`
-        const selfMsg = selfChatMessages[Math.floor(Math.random() * selfChatMessages.length)]
-        await sock.sendMessage(selfJid, { text: selfMsg })
-      } catch {}
-      scheduleSelfChat()
-    }, nextDelay)
-  }
-  scheduleSelfChat()
-
   // Clean up timers on disconnect
   sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'close') {
       clearTimeout(presenceTimer)
       clearTimeout(connectionDropTimer)
-      clearTimeout(selfChatTimer)
     }
   })
 
