@@ -294,7 +294,17 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
       },
     },
-    logger: (() => { const l = { level: 'silent', trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {} }; l.child = () => l; return l })(),
+    logger: (() => {
+      const l = {
+        level: 'error',
+        trace: () => {}, debug: () => {}, info: () => {},
+        warn: (...args) => console.log(`[${lineId}][WA-warn]`, ...args),
+        error: (...args) => console.error(`[${lineId}][WA-error]`, ...args),
+        fatal: (...args) => console.error(`[${lineId}][WA-fatal]`, ...args),
+      }
+      l.child = () => l
+      return l
+    })(),
   })
 
   sessionData.socket = sock
@@ -350,6 +360,8 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
       saveWarmUpState(lineId, antiban)
 
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+      const errorMsg = lastDisconnect?.error?.message || lastDisconnect?.error || 'unknown'
+      console.log(`[${lineId}] Connection closed: reason=${reason}, error=${errorMsg}`)
       sessionData.status = 'disconnected'
 
       // Skip alerts for intentional simulated disconnects
