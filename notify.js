@@ -12,10 +12,11 @@ const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions_data'
 const RETRY_FILE = path.join(SESSIONS_DIR, '_webhook_retries.json')
 
 // Startup diagnostics — visible in Railway logs to confirm env vars are set
+const _supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
 console.log('[notify] Config check:', {
-  captaUrl: CAPTA_URL ? CAPTA_URL.slice(0, 40) + '...' : 'MISSING ⚠️',
+  captaUrl: CAPTA_URL ? CAPTA_URL : 'MISSING ⚠️',
   internalSecret: process.env.INTERNAL_SECRET ? '✓ set' : 'MISSING ⚠️',
-  supabaseUrl: process.env.SUPABASE_URL ? '✓ set' : 'MISSING ⚠️',
+  supabaseUrl: _supabaseUrl ? _supabaseUrl : 'MISSING ⚠️',
   serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ set' : 'MISSING ⚠️',
   telegramBot: process.env.TELEGRAM_BOT_TOKEN ? '✓ set' : 'MISSING',
 })
