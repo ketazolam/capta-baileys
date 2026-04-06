@@ -66,12 +66,21 @@ setInterval(() => {
 export const sessionManager = {
   count: () => sessions.size,
   get: (lineId) => sessions.get(lineId),
-  getAll: () => [...sessions.entries()].map(([id, s]) => ({
-    lineId: id,
-    status: s.status,
-    phone: s.phone,
-    hasQR: !!s.qr,
-  })),
+  getAll: () => [...sessions.entries()].map(([id, s]) => {
+    const connectedMs = s.connectedAt ? Date.now() - s.connectedAt : null
+    const lastMsgMs = s.lastMessageAt ? Date.now() - s.lastMessageAt : null
+    const neverReceived = s.status === 'connected' && !s.lastMessageAt && connectedMs > 45 * 60 * 1000
+    const longSilence = s.status === 'connected' && lastMsgMs !== null && lastMsgMs > 4 * 60 * 60 * 1000
+    return {
+      lineId: id,
+      status: s.status,
+      phone: s.phone,
+      hasQR: !!s.qr,
+      lastMessageAt: s.lastMessageAt ? new Date(s.lastMessageAt).toISOString() : null,
+      connectedAt: s.connectedAt ? new Date(s.connectedAt).toISOString() : null,
+      zombieSuspected: neverReceived || longSilence,
+    }
+  }),
 
   async create(lineId) {
     const existing = sessions.get(lineId)
@@ -208,6 +217,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
     reconnectAttempts: 0,
     simulatedDisconnect: false, // Flag to suppress Telegram alerts on intentional drops
     _createdAt: Date.now(),
+    connectedAt: null,       // When the session last became connected
+    lastMessageAt: null,     // When the last real inbound message was received
+    _zombieTimer: null,      // Timer for zombie detection checks
   }
   sessions.set(lineId, sessionData)
   if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttemptOverride > 0 ? `/r${reconnectAttemptOverride}` : ''})`)
@@ -295,16 +307,42 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
       sessionData.qr = null
       sessionData.phone = sock.user?.id?.split(':')[0] || null
       sessionData.reconnectAttempts = 0 // Reset backoff on success
+      sessionData.connectedAt = Date.now()
+      sessionData.lastMessageAt = null // Reset — fresh connection
       console.log(`[${lineId}] Connected as ${sessionData.phone}`)
 
       // Notify antiban of successful reconnection
       try { antiban.onReconnect?.() } catch {}
 
       await notifyCapta(lineId, 'connected', { phone: sessionData.phone })
+
+      // --- Zombie detection: check every 30min if we're connected but receiving nothing ---
+      // A zombie session has WS alive but WA stopped delivering messages (usually after 401 conflict)
+      if (sessionData._zombieTimer) clearInterval(sessionData._zombieTimer)
+      sessionData._zombieTimer = setInterval(async () => {
+        if (sessionData.status !== 'connected') return
+        if (!isActiveTime()) return // Don't alert at night — silence is normal
+        const connectedMs = Date.now() - (sessionData.connectedAt || Date.now())
+        const lastMsgMs = sessionData.lastMessageAt ? Date.now() - sessionData.lastMessageAt : connectedMs
+        // Zombie if: connected >45min AND never received a message (or last message >4h ago)
+        const neverReceived = !sessionData.lastMessageAt && connectedMs > 45 * 60 * 1000
+        const longSilence = sessionData.lastMessageAt && lastMsgMs > 4 * 60 * 60 * 1000
+        if (neverReceived || longSilence) {
+          const reason = neverReceived
+            ? `conectado hace ${Math.round(connectedMs / 60000)}min sin recibir ningún mensaje`
+            : `último mensaje hace ${Math.round(lastMsgMs / 3600000)}h`
+          console.error(`[${lineId}] 🧟 ZOMBIE DETECTED — ${reason}. Forzando reconexión.`)
+          await notifyCapta(lineId, 'zombie', { reason })
+          clearInterval(sessionData._zombieTimer)
+          sessionData._zombieTimer = null
+          try { sock.end() } catch {} // triggers normal reconnect flow
+        }
+      }, 30 * 60 * 1000) // check every 30 minutes
     }
 
     if (connection === 'close') {
       clearInterval(warmUpPersistInterval)
+      if (sessionData._zombieTimer) { clearInterval(sessionData._zombieTimer); sessionData._zombieTimer = null }
       saveWarmUpState(lineId, antiban)
 
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
@@ -361,6 +399,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         console.log(`[${lineId}] Skipping stale message (${now - msgTime}s old)`)
         continue
       }
+
+      // Track last real message received — used by zombie detection
+      sessionData.lastMessageAt = Date.now()
 
       await handleMessage(lineId, sock, msg, sessionData.proxyAgent)
     }

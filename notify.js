@@ -11,6 +11,7 @@ const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
 const disconnectAlertThrottle = new Map()
 const THROTTLE_MS = 5 * 60 * 1000
 
+
 export async function sendTelegramAlert(text) {
   return sendTelegram(text)
 }
@@ -83,6 +84,23 @@ export async function notifyCapta(lineId, event, data) {
         break
       }
 
+      case 'zombie': {
+        // Zombie detected: connected WebSocket but not receiving messages
+        const { data: zombieLine } = await supabase
+          .from('lines')
+          .select('name, phone_number, projects(name)')
+          .eq('id', lineId)
+          .single()
+        const lineName = zombieLine?.name || lineId.slice(0, 8)
+        const linePhone = zombieLine?.phone_number ? ` (+${zombieLine.phone_number})` : ''
+        const projectName = zombieLine?.projects?.name ? ` — proyecto <b>${zombieLine.projects.name}</b>` : ''
+        console.error(`[notify] 🧟 Zombie alert sent for line ${lineId.slice(0, 8)}`)
+        await sendTelegram(
+          `🧟 <b>ZOMBIE DETECTADO${projectName}</b>\n📱 ${lineName}${linePhone}\n⚠️ ${data?.reason || 'conexión viva pero sin recibir mensajes'}\n🔄 Reconectando automáticamente...\n\nSi el problema persiste, escaneá QR nuevo en: ${CAPTA_URL}`
+        )
+        break
+      }
+
       case 'comprobante': {
         const { data: line } = await supabase
           .from('lines')
@@ -112,6 +130,9 @@ export async function notifyCapta(lineId, event, data) {
         const { data: { publicUrl } } = supabase.storage
           .from('comprobantes')
           .getPublicUrl(fileName)
+
+        // Update last_message_at — proves bot is alive and receiving messages
+        await supabase.from('lines').update({ last_message_at: new Date().toISOString() }).eq('id', lineId)
 
         // Call unified Capta webhook — Claude analyzes + creates sale + fires CAPI
         await fetch(`${CAPTA_URL}/api/webhook/comprobante`, {
@@ -159,7 +180,8 @@ export async function notifyCapta(lineId, event, data) {
       }
 
       case 'message': {
-        // Update last_seen + name on contact
+        // Update last_seen + name on contact, and last_message_at on line
+        await supabase.from('lines').update({ last_message_at: new Date().toISOString() }).eq('id', lineId)
         const { data: msgLine } = await supabase
           .from('lines')
           .select('project_id')

@@ -1,14 +1,44 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager, recentContacts } from './sessions.js'
+import { sessionManager } from './sessions.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
-app.get('/health', (_, res) => res.json({ ok: true, sessions: sessionManager.count() }))
+const supabase = createClient(
+  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+)
+
+// --- Heartbeat: update last_ping_at in Supabase every 5 minutes ---
+// Proves the Baileys process is alive regardless of message activity.
+setInterval(async () => {
+  try {
+    const sessions = sessionManager.getAll()
+    for (const s of sessions) {
+      if (s.status !== 'connected') continue
+      await supabase.from('lines').update({ last_ping_at: new Date().toISOString() }).eq('id', s.lineId)
+    }
+  } catch {}
+}, 5 * 60 * 1000)
+
+app.get('/health', (_, res) => {
+  const sessions = sessionManager.getAll()
+  res.json({
+    ok: true,
+    sessions: sessionManager.count(),
+    lines: sessions.map(s => ({
+      lineId: s.lineId,
+      status: s.status,
+      phone: s.phone,
+      lastMessageAt: s.lastMessageAt,
+      zombieSuspected: s.zombieSuspected,
+    })),
+  })
+})
 
 // Proxy diagnostic endpoint
 app.get('/proxy-check', async (req, res) => {
