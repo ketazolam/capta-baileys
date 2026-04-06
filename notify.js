@@ -228,14 +228,16 @@ export async function notifyCapta(lineId, event, data) {
           }
           // Pass LD visit code for exact attribution (extracted from first message)
           if (data.visitCode) convPayload.visit_code = data.visitCode
-          await fetch(`${CAPTA_URL}/api/webhook/conversation`, {
+          const csRes = await fetch(`${CAPTA_URL}/api/webhook/conversation`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
               'x-internal-secret': process.env.INTERNAL_SECRET || '',
             },
             body: JSON.stringify(convPayload),
-          }).catch(err => console.error('[notify] conversation_start error:', err.message))
+            signal: AbortSignal.timeout(15000),
+          }).catch(err => { console.error('[notify] conversation_start error:', err.message); return null })
+          if (csRes && !csRes.ok) console.error(`[notify] conversation_start HTTP ${csRes.status}`)
         }
         break
       }
@@ -306,6 +308,11 @@ export async function processRetryQueue() {
         console.log(`[retry] Webhook recovered: ${entry.phone}, sale: ${json.sale_id}`)
         await sendTelegram(`✅ <b>WEBHOOK RECUPERADO</b>\n📱 +${entry.phone}\n💰 Comprobante procesado tras ${entry.attempts} reintentos`)
         continue // remove from queue
+      }
+      // 401/400 = permanent error, no point retrying
+      if (res.status === 401 || res.status === 400) {
+        console.error(`[retry] Permanent error ${res.status} for ${entry.phone} — removing from queue`)
+        continue
       }
     } catch (err) {
       console.error(`[retry] Webhook retry #${entry.attempts} failed:`, err.message)
