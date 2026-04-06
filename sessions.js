@@ -44,6 +44,14 @@ const MAX_MESSAGE_AGE_SECONDS = 300 // Ignore messages older than 5min (covers r
 // Tracks contacts who messaged us (lineId:phone → timestamp)
 export const recentContacts = new Map()
 
+// Clean up recentContacts every hour — removes entries older than 25h to prevent memory growth
+setInterval(() => {
+  const cutoff = Date.now() - TWENTY_FOUR_HOURS - 60 * 60 * 1000
+  for (const [key, ts] of recentContacts) {
+    if (ts < cutoff) recentContacts.delete(key)
+  }
+}, 60 * 60 * 1000)
+
 // Get current hour in Argentina timezone (UTC-3), works regardless of server TZ
 function argentinaHour() {
   return new Date(Date.now() - 3 * 60 * 60 * 1000).getUTCHours()
