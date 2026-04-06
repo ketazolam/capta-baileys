@@ -11,6 +11,15 @@ const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions_data'
 const RETRY_FILE = path.join(SESSIONS_DIR, '_webhook_retries.json')
 
+// Startup diagnostics — visible in Railway logs to confirm env vars are set
+console.log('[notify] Config check:', {
+  captaUrl: CAPTA_URL ? CAPTA_URL.slice(0, 40) + '...' : 'MISSING ⚠️',
+  internalSecret: process.env.INTERNAL_SECRET ? '✓ set' : 'MISSING ⚠️',
+  supabaseUrl: process.env.SUPABASE_URL ? '✓ set' : 'MISSING ⚠️',
+  serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ set' : 'MISSING ⚠️',
+  telegramBot: process.env.TELEGRAM_BOT_TOKEN ? '✓ set' : 'MISSING',
+})
+
 // Throttle: max 1 disconnect alert per line every 5 minutes (avoids spam on micro-cuts)
 const disconnectAlertThrottle = new Map()
 const THROTTLE_MS = 5 * 60 * 1000
@@ -112,7 +121,11 @@ export async function notifyCapta(lineId, event, data) {
           .eq('id', lineId)
           .single()
 
-        if (!line) break
+        if (!line) {
+          console.error(`[notify] comprobante: line ${lineId.slice(0, 8)} not found in Supabase — check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Railway`)
+          break
+        }
+        console.log(`[notify] comprobante: project_id=${line.project_id}, phone=${data.phone}`)
 
         // Upsert contact as fallback — image-first leads may not have triggered 'message' event
         // Primary contact creation is via conversation_start webhook, but that can fail on timeout
@@ -123,7 +136,8 @@ export async function notifyCapta(lineId, event, data) {
             last_seen_at: new Date().toISOString(),
           }
           if (data.pushName) contactData.name = data.pushName
-          await supabase.from('contacts').upsert(contactData, { onConflict: 'project_id,phone' }).catch(() => {})
+          await supabase.from('contacts').upsert(contactData, { onConflict: 'project_id,phone' })
+            .catch(err => console.error(`[notify] contact upsert error:`, err.message))
         }
 
         // Upload image to Supabase Storage
@@ -182,6 +196,8 @@ export async function notifyCapta(lineId, event, data) {
               break
             }
             console.error(`[notify] webhook HTTP ${res.status}:`, json)
+            // 401 = secret incorrecto, 400 = payload inválido — no tiene sentido reintentar
+            if (res.status === 401 || res.status === 400) break
           } catch (err) {
             console.error(`[notify] webhook/comprobante attempt ${attempt + 1}:`, err.message)
           }
