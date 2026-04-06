@@ -114,6 +114,18 @@ export async function notifyCapta(lineId, event, data) {
 
         if (!line) break
 
+        // Upsert contact as fallback — image-first leads may not have triggered 'message' event
+        // Primary contact creation is via conversation_start webhook, but that can fail on timeout
+        if (data.phone) {
+          const contactData = {
+            project_id: line.project_id,
+            phone: data.phone,
+            last_seen_at: new Date().toISOString(),
+          }
+          if (data.pushName) contactData.name = data.pushName
+          await supabase.from('contacts').upsert(contactData, { onConflict: 'project_id,phone' }).catch(() => {})
+        }
+
         // Upload image to Supabase Storage
         const fileExt = data.mimetype?.includes('png') ? 'png' : 'jpg'
         const fileName = `${line.project_id}/${Date.now()}_${data.phone}.${fileExt}`
