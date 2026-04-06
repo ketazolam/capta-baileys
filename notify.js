@@ -135,23 +135,43 @@ export async function notifyCapta(lineId, event, data) {
         await supabase.from('lines').update({ last_message_at: new Date().toISOString() }).eq('id', lineId)
 
         // Call unified Capta webhook — Claude analyzes + creates sale + fires CAPI
-        await fetch(`${CAPTA_URL}/api/webhook/comprobante`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-internal-secret': process.env.INTERNAL_SECRET || '',
-          },
-          body: JSON.stringify({
-            project_id: line.project_id,
-            phone: data.phone,
-            image_url: publicUrl,
-            line_id: lineId,
-            auto_confirm: true,
-          }),
-        }).then(async (res) => {
-          const json = await res.json().catch(() => ({}))
-          console.log(`[notify] comprobante result:`, json.status, json.extracted?.amount)
-        }).catch(err => console.error('[notify] webhook/comprobante error:', err.message))
+        const webhookPayload = {
+          project_id: line.project_id,
+          phone: data.phone,
+          image_url: publicUrl,
+          line_id: lineId,
+          auto_confirm: true,
+        }
+        const webhookHeaders = {
+          'Content-Type': 'application/json',
+          'x-internal-secret': process.env.INTERNAL_SECRET || '',
+        }
+        let webhookOk = false
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            if (attempt > 0) await new Promise(r => setTimeout(r, 5000)) // 5s retry delay
+            const res = await fetch(`${CAPTA_URL}/api/webhook/comprobante`, {
+              method: 'POST',
+              headers: webhookHeaders,
+              body: JSON.stringify(webhookPayload),
+              signal: AbortSignal.timeout(25000), // 25s timeout (Vercel can cold-start)
+            })
+            const json = await res.json().catch(() => ({}))
+            if (res.ok) {
+              console.log(`[notify] comprobante result:`, json.status, json.extracted?.amount)
+              webhookOk = true
+              break
+            }
+            console.error(`[notify] webhook HTTP ${res.status}:`, json)
+          } catch (err) {
+            console.error(`[notify] webhook/comprobante attempt ${attempt + 1}:`, err.message)
+          }
+        }
+        if (!webhookOk) {
+          await sendTelegram(
+            `🚨 <b>WEBHOOK FALLÓ</b>\n📱 +${data.phone}\n🔗 Imagen subida: ${publicUrl}\n⚠️ El comprobante está en Storage pero Capta no lo procesó. Reenviar manualmente.`
+          )
+        }
 
         break
       }

@@ -69,7 +69,7 @@ export const sessionManager = {
   getAll: () => [...sessions.entries()].map(([id, s]) => {
     const connectedMs = s.connectedAt ? Date.now() - s.connectedAt : null
     const lastMsgMs = s.lastMessageAt ? Date.now() - s.lastMessageAt : null
-    const neverReceived = s.status === 'connected' && !s.lastMessageAt && connectedMs > 45 * 60 * 1000
+    const neverReceived = s.status === 'connected' && !s.lastMessageAt && connectedMs > 2 * 60 * 60 * 1000
     const longSilence = s.status === 'connected' && lastMsgMs !== null && lastMsgMs > 4 * 60 * 60 * 1000
     return {
       lineId: id,
@@ -308,7 +308,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
       sessionData.phone = sock.user?.id?.split(':')[0] || null
       sessionData.reconnectAttempts = 0 // Reset backoff on success
       sessionData.connectedAt = Date.now()
-      sessionData.lastMessageAt = null // Reset — fresh connection
+      // Preserve lastMessageAt across simulated reconnects to avoid false zombie alerts.
+      // Only reset on truly fresh connections (first connect or after 401 loggedOut).
+      if (!sessionData.lastMessageAt) sessionData.lastMessageAt = null
       console.log(`[${lineId}] Connected as ${sessionData.phone}`)
 
       // Notify antiban of successful reconnection
@@ -324,8 +326,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         if (!isActiveTime()) return // Don't alert at night — silence is normal
         const connectedMs = Date.now() - (sessionData.connectedAt || Date.now())
         const lastMsgMs = sessionData.lastMessageAt ? Date.now() - sessionData.lastMessageAt : connectedMs
-        // Zombie if: connected >45min AND never received a message (or last message >4h ago)
-        const neverReceived = !sessionData.lastMessageAt && connectedMs > 45 * 60 * 1000
+        // Zombie if: connected >2h AND never received a message (or last message >4h ago)
+        // 2h threshold avoids false positives on low-traffic accounts (e.g. Sofycon quiet hours)
+        const neverReceived = !sessionData.lastMessageAt && connectedMs > 2 * 60 * 60 * 1000
         const longSilence = sessionData.lastMessageAt && lastMsgMs > 4 * 60 * 60 * 1000
         if (neverReceived || longSilence) {
           const reason = neverReceived
@@ -364,8 +367,20 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         await notifyCapta(lineId, 'disconnected', { reason })
       }
 
-      const shouldReconnect = reason !== DisconnectReason.loggedOut
-      if (shouldReconnect) {
+      if (reason === DisconnectReason.loggedOut) {
+        // 401 = session invalidated (someone opened WA on phone, or device revoked).
+        // Clear auth files so next session generates a fresh QR.
+        const sessionPath = path.join(SESSIONS_DIR, lineId)
+        try { if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true }) } catch {}
+        sessions.delete(lineId)
+        console.log(`[${lineId}] Auth cleared after 401 — starting fresh session with new QR`)
+        // Auto-restart: generate new QR immediately instead of staying dead
+        setTimeout(() => {
+          sessionManager.create(lineId).catch(err =>
+            console.error(`[${lineId}] Failed to auto-restart after 401:`, err.message)
+          )
+        }, 5000)
+      } else {
         sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1
 
         // Cap reconnect attempts to avoid infinite loops on temp bans
@@ -379,8 +394,6 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         console.log(`[${lineId}] Reconnecting in ${Math.round(delay / 1000)}s (attempt ${sessionData.reconnectAttempts})...`)
         const attempts = sessionData.reconnectAttempts
         sessionData.reconnectTimeout = setTimeout(() => startSession(lineId, attempts), delay)
-      } else {
-        sessions.delete(lineId)
       }
     }
   })
@@ -533,7 +546,11 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
     }
     try {
       const dlOpts = proxyAgent ? { options: { httpsAgent: proxyAgent, httpAgent: proxyAgent } } : {}
-      const buffer = await downloadMediaMessage(msg, 'buffer', dlOpts, { reuploadRequest: sock.updateMediaMessage })
+      // Timeout: 30s max to avoid blocking the message pipeline
+      const buffer = await Promise.race([
+        downloadMediaMessage(msg, 'buffer', dlOpts, { reuploadRequest: sock.updateMediaMessage }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Media download timeout (30s)')), 30000)),
+      ])
       const base64 = buffer.toString('base64')
       await notifyCapta(lineId, 'comprobante', {
         phone,
@@ -543,6 +560,10 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
       })
     } catch (err) {
       console.error(`[${lineId}] Error sending comprobante:`, err.message)
+      // CRITICAL: alert on lost comprobante — this is a missed conversion
+      sendTelegramAlert(
+        `🚨 <b>COMPROBANTE PERDIDO</b>\n📱 +${phone}\n❌ ${err.message}\n⚠️ Pedir al lead que reenvíe la imagen`
+      ).catch(() => {})
     }
     return
   }
