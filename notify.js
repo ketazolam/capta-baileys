@@ -1,4 +1,6 @@
 import { createClient } from '@supabase/supabase-js'
+import fs from 'fs'
+import path from 'path'
 
 const supabase = createClient(
   process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -6,6 +8,8 @@ const supabase = createClient(
 )
 
 const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL
+const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions_data'
+const RETRY_FILE = path.join(SESSIONS_DIR, '_webhook_retries.json')
 
 // Throttle: max 1 disconnect alert per line every 5 minutes (avoids spam on micro-cuts)
 const disconnectAlertThrottle = new Map()
@@ -171,8 +175,10 @@ export async function notifyCapta(lineId, event, data) {
           }
         }
         if (!webhookOk) {
+          // Save to retry queue for automatic retry every 5 minutes
+          saveFailedWebhook(webhookPayload, publicUrl, data.phone)
           await sendTelegram(
-            `🚨 <b>WEBHOOK FALLÓ</b>\n📱 +${data.phone}\n🔗 Imagen subida: ${publicUrl}\n⚠️ El comprobante está en Storage pero Capta no lo procesó. Reenviar manualmente.`
+            `🚨 <b>WEBHOOK FALLÓ</b>\n📱 +${data.phone}\n🔗 Imagen subida: ${publicUrl}\n⚠️ Comprobante en cola de reintentos automáticos.`
           )
         }
 
@@ -186,17 +192,20 @@ export async function notifyCapta(lineId, event, data) {
           .eq('id', lineId)
           .single()
         if (csLine) {
+          const convPayload = {
+            project_id: csLine.project_id,
+            phone: data.phone,
+            line_id: lineId,
+          }
+          // Pass LD visit code for exact attribution (extracted from first message)
+          if (data.visitCode) convPayload.visit_code = data.visitCode
           await fetch(`${CAPTA_URL}/api/webhook/conversation`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
               'x-internal-secret': process.env.INTERNAL_SECRET || '',
             },
-            body: JSON.stringify({
-              project_id: csLine.project_id,
-              phone: data.phone,
-              line_id: lineId,
-            }),
+            body: JSON.stringify(convPayload),
           }).catch(err => console.error('[notify] conversation_start error:', err.message))
         }
         break
@@ -226,4 +235,58 @@ export async function notifyCapta(lineId, event, data) {
   } catch (err) {
     console.error(`[notify] ${event}:`, err.message)
   }
+}
+
+// --- Webhook retry queue: persist failed webhooks to disk, retry every 5 minutes ---
+
+function saveFailedWebhook(payload, imageUrl, phone) {
+  try {
+    const retries = loadRetryQueue()
+    retries.push({ payload, imageUrl, phone, attempts: 0, createdAt: Date.now() })
+    fs.writeFileSync(RETRY_FILE, JSON.stringify(retries))
+  } catch (err) {
+    console.error('[notify] Failed to save webhook retry:', err.message)
+  }
+}
+
+function loadRetryQueue() {
+  try {
+    if (fs.existsSync(RETRY_FILE)) return JSON.parse(fs.readFileSync(RETRY_FILE, 'utf8'))
+  } catch {}
+  return []
+}
+
+export async function processRetryQueue() {
+  const retries = loadRetryQueue()
+  if (!retries.length) return
+  const remaining = []
+  for (const entry of retries) {
+    entry.attempts++
+    try {
+      const res = await fetch(`${CAPTA_URL}/api/webhook/comprobante`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-internal-secret': process.env.INTERNAL_SECRET || '',
+        },
+        body: JSON.stringify(entry.payload),
+        signal: AbortSignal.timeout(25000),
+      })
+      if (res.ok) {
+        const json = await res.json().catch(() => ({}))
+        console.log(`[retry] Webhook recovered: ${entry.phone}, sale: ${json.sale_id}`)
+        await sendTelegram(`✅ <b>WEBHOOK RECUPERADO</b>\n📱 +${entry.phone}\n💰 Comprobante procesado tras ${entry.attempts} reintentos`)
+        continue // remove from queue
+      }
+    } catch (err) {
+      console.error(`[retry] Webhook retry #${entry.attempts} failed:`, err.message)
+    }
+    // Keep in queue if under 20 attempts (~1.5 hours of retries)
+    if (entry.attempts < 20) remaining.push(entry)
+    else {
+      console.error(`[retry] Giving up on webhook after 20 attempts: ${entry.phone}`)
+      await sendTelegram(`🔴 <b>WEBHOOK ABANDONADO</b>\n📱 +${entry.phone}\n🔗 ${entry.imageUrl}\n⚠️ 20 reintentos fallidos. Procesar manualmente.`)
+    }
+  }
+  fs.writeFileSync(RETRY_FILE, JSON.stringify(remaining))
 }

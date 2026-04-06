@@ -404,7 +404,10 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
           }
         }, 5000)
       } else {
-        sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1
+        // 408 = QR timeout (user didn't scan) — not a real connection error, don't count it
+        if (reason !== 408) {
+          sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1
+        }
 
         // Cap reconnect attempts to avoid infinite loops on temp bans
         if (sessionData.reconnectAttempts > 10) {
@@ -624,10 +627,15 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
   // Text message
   const text = content?.conversation || content?.extendedTextMessage?.text
   if (text) {
+    // Extract LD code (visit code) from first message — enables exact attribution
+    // Format: LD_XXXXXXXX (8 uppercase alphanumeric chars from sessionId)
+    const ldMatch = text.match(/LD_([A-Z0-9_-]{6,10})/i)
+    const visitCode = ldMatch ? ldMatch[1].toUpperCase() : null
+
     await notifyCapta(lineId, 'message', { phone, text, pushName })
 
     if (isNewContact) {
-      await notifyCapta(lineId, 'conversation_start', { phone, text, pushName })
+      await notifyCapta(lineId, 'conversation_start', { phone, text, pushName, visitCode })
     }
   }
 }

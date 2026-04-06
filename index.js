@@ -2,6 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
 import { sessionManager } from './sessions.js'
+import { processRetryQueue } from './notify.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -22,6 +23,8 @@ setInterval(async () => {
       if (s.status !== 'connected') continue
       await supabase.from('lines').update({ last_ping_at: new Date().toISOString() }).eq('id', s.lineId)
     }
+    // Retry any failed comprobante webhooks
+    await processRetryQueue()
   } catch {}
 }, 5 * 60 * 1000)
 
