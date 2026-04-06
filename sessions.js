@@ -10,7 +10,13 @@ import { AntiBan } from 'baileys-antiban'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import path from 'path'
 import fs from 'fs'
+import { createClient } from '@supabase/supabase-js'
 import { notifyCapta, sendTelegramAlert } from './notify.js'
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+)
 
 // Residential proxy — routes WhatsApp WebSocket through residential IP
 // Set PROXY_URL env var: http://user:pass@host:port
@@ -107,8 +113,13 @@ export const sessionManager = {
 
   async delete(lineId) {
     const session = sessions.get(lineId)
-    // Cancel any pending reconnect timeout to prevent zombie sessions
+    // Cancel all timers to prevent leaks
     if (session?.reconnectTimeout) clearTimeout(session.reconnectTimeout)
+    if (session?._zombieTimer) clearInterval(session._zombieTimer)
+    if (session?._warmUpPersistInterval) clearInterval(session._warmUpPersistInterval)
+    if (session?._connectTimeout) clearTimeout(session._connectTimeout)
+    if (session?._presenceTimer) clearTimeout(session._presenceTimer)
+    if (session?._connectionDropTimer) clearTimeout(session._connectionDropTimer)
     if (session?.socket) {
       try { await session.socket.logout() } catch {}
     }
@@ -220,6 +231,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
     connectedAt: null,       // When the session last became connected
     lastMessageAt: null,     // When the last real inbound message was received
     _zombieTimer: null,      // Timer for zombie detection checks
+    _warmUpPersistInterval: null,
+    _presenceTimer: null,
+    _connectionDropTimer: null,
   }
   sessions.set(lineId, sessionData)
   if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttemptOverride > 0 ? `/r${reconnectAttemptOverride}` : ''})`)
@@ -290,7 +304,8 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
   })
 
   // Persist warm-up state every 5 minutes
-  const warmUpPersistInterval = setInterval(() => saveWarmUpState(lineId, antiban), 5 * 60 * 1000)
+  if (sessionData._warmUpPersistInterval) clearInterval(sessionData._warmUpPersistInterval)
+  sessionData._warmUpPersistInterval = setInterval(() => saveWarmUpState(lineId, antiban), 5 * 60 * 1000)
 
   sock.ev.on('creds.update', saveCreds)
 
@@ -344,7 +359,7 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
     }
 
     if (connection === 'close') {
-      clearInterval(warmUpPersistInterval)
+      if (sessionData._warmUpPersistInterval) { clearInterval(sessionData._warmUpPersistInterval); sessionData._warmUpPersistInterval = null }
       if (sessionData._zombieTimer) { clearInterval(sessionData._zombieTimer); sessionData._zombieTimer = null }
       saveWarmUpState(lineId, antiban)
 
@@ -375,10 +390,18 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         sessions.delete(lineId)
         console.log(`[${lineId}] Auth cleared after 401 — starting fresh session with new QR`)
         // Auto-restart: generate new QR immediately instead of staying dead
-        setTimeout(() => {
-          sessionManager.create(lineId).catch(err =>
+        // But skip if the line was deactivated in Supabase (avoids phantom QR generation)
+        setTimeout(async () => {
+          try {
+            const { data: line } = await supabase.from('lines').select('is_active').eq('id', lineId).single()
+            if (line?.is_active === false) {
+              console.log(`[${lineId}] Line inactive in Supabase — skipping auto-restart after 401`)
+              return
+            }
+            await sessionManager.create(lineId)
+          } catch (err) {
             console.error(`[${lineId}] Failed to auto-restart after 401:`, err.message)
-          )
+          }
         }, 5000)
       } else {
         sessionData.reconnectAttempts = (sessionData.reconnectAttempts || 0) + 1
@@ -386,6 +409,10 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         // Cap reconnect attempts to avoid infinite loops on temp bans
         if (sessionData.reconnectAttempts > 10) {
           console.log(`[${lineId}] Max reconnect attempts reached, giving up`)
+          const CAPTA_URL = process.env.CAPTA_APP_URL || process.env.NEXT_PUBLIC_APP_URL || ''
+          await sendTelegramAlert(
+            `🔴 <b>LÍNEA MUERTA</b>\n📱 Línea ${lineId.slice(0, 8)}\n⚠️ 10 reconexiones fallidas. Sesión eliminada.\n🔗 Reconectar en: ${CAPTA_URL}`
+          )
           sessions.delete(lineId)
           return
         }
@@ -423,10 +450,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
   // --- Simulate human presence: go online/offline with VARIABLE intervals ---
   // Fixed setInterval is a fingerprint — real humans are never periodic.
   // Use recursive setTimeout so each cycle has a different delay.
-  let presenceTimer = null
   function schedulePresenceCycle() {
     const nextDelay = (15 + Math.random() * 45) * 60 * 1000 // 15-60 min, different each time
-    presenceTimer = setTimeout(async () => {
+    sessionData._presenceTimer = setTimeout(async () => {
       if (sessionData.status !== 'connected') { schedulePresenceCycle(); return }
       if (!isActiveTime()) {
         try { await sock.sendPresenceUpdate('unavailable') } catch {}
@@ -448,10 +474,9 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
 
   // --- Simulate natural connection drops (phone sleep, network switch) ---
   // Variable interval (not fixed setInterval) — real devices aren't periodic
-  let connectionDropTimer = null
   function scheduleConnectionDrop() {
     const nextDelay = (3 + Math.random() * 3) * 60 * 60 * 1000 // 3-6 hours, different each time
-    connectionDropTimer = setTimeout(async () => {
+    sessionData._connectionDropTimer = setTimeout(async () => {
       if (sessionData.status !== 'connected') { scheduleConnectionDrop(); return }
       const hour = argentinaHour()
       if (hour >= 1 && hour <= 6) {
@@ -477,8 +502,8 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
   // Clean up timers on disconnect
   sock.ev.on('connection.update', ({ connection }) => {
     if (connection === 'close') {
-      clearTimeout(presenceTimer)
-      clearTimeout(connectionDropTimer)
+      if (sessionData._presenceTimer) { clearTimeout(sessionData._presenceTimer); sessionData._presenceTimer = null }
+      if (sessionData._connectionDropTimer) { clearTimeout(sessionData._connectionDropTimer); sessionData._connectionDropTimer = null }
     }
   })
 
@@ -546,11 +571,21 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
     }
     try {
       const dlOpts = proxyAgent ? { options: { httpsAgent: proxyAgent, httpAgent: proxyAgent } } : {}
-      // Timeout: 30s max to avoid blocking the message pipeline
-      const buffer = await Promise.race([
-        downloadMediaMessage(msg, 'buffer', dlOpts, { reuploadRequest: sock.updateMediaMessage }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Media download timeout (30s)')), 30000)),
-      ])
+      // Retry once on failure (covers transient network issues)
+      let buffer
+      for (let dlAttempt = 0; dlAttempt < 2; dlAttempt++) {
+        try {
+          if (dlAttempt > 0) await new Promise(r => setTimeout(r, 5000))
+          buffer = await Promise.race([
+            downloadMediaMessage(msg, 'buffer', dlOpts, { reuploadRequest: sock.updateMediaMessage }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Media download timeout (30s)')), 30000)),
+          ])
+          break
+        } catch (dlErr) {
+          if (dlAttempt === 0) { console.warn(`[${lineId}] Media download attempt 1 failed: ${dlErr.message}, retrying in 5s...`); continue }
+          throw dlErr
+        }
+      }
       const base64 = buffer.toString('base64')
       await notifyCapta(lineId, 'comprobante', {
         phone,

@@ -124,6 +124,9 @@ export async function notifyCapta(lineId, event, data) {
 
         if (uploadErr) {
           console.error(`[notify] Storage upload error:`, uploadErr.message)
+          await sendTelegram(
+            `🚨 <b>STORAGE UPLOAD FALLÓ</b>\n📱 +${data.phone}\n❌ ${uploadErr.message}\n⚠️ Comprobante perdido. Pedir al lead que reenvíe.`
+          )
           break
         }
 
@@ -147,7 +150,7 @@ export async function notifyCapta(lineId, event, data) {
           'x-internal-secret': process.env.INTERNAL_SECRET || '',
         }
         let webhookOk = false
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
           try {
             if (attempt > 0) await new Promise(r => setTimeout(r, 5000)) // 5s retry delay
             const res = await fetch(`${CAPTA_URL}/api/webhook/comprobante`, {
