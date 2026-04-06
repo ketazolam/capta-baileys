@@ -237,6 +237,16 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
     _connectionDropTimer: null,
   }
   sessions.set(lineId, sessionData)
+
+  // Pre-load project_id async — avoids losing contacts/comprobantes that arrive before the lazy load resolves
+  supabase.from('lines').select('project_id').eq('id', lineId).single()
+    .then(({ data: ld, error: ldErr }) => {
+      if (ldErr) console.error(`[${lineId}] Failed to pre-load project_id:`, ldErr.message)
+      else if (ld?.project_id) { sessionData._projectId = ld.project_id; console.log(`[${lineId}] project_id pre-loaded: ${ld.project_id.slice(0, 8)}`) }
+      else console.warn(`[${lineId}] Line has no project_id in Supabase — contacts won't be created until this is fixed`)
+    })
+    .catch(err => console.error(`[${lineId}] project_id pre-load exception:`, err.message))
+
   if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttemptOverride > 0 ? `/r${reconnectAttemptOverride}` : ''})`)
 
   const sock = makeWASocket({

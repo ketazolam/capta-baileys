@@ -221,6 +221,19 @@ export async function notifyCapta(lineId, event, data) {
           .eq('id', lineId)
           .single()
         if (csLine) {
+          // Direct upsert — doesn't depend on HTTP webhook reaching Vercel (cold-starts, timeouts)
+          if (data.phone) {
+            const csContactData = {
+              project_id: csLine.project_id,
+              phone: data.phone,
+              last_seen_at: new Date().toISOString(),
+            }
+            if (data.pushName) csContactData.name = data.pushName
+            const { error: csUpsertErr } = await supabase.from('contacts')
+              .upsert(csContactData, { onConflict: 'project_id,phone' })
+            if (csUpsertErr) console.error(`[notify] conversation_start upsert error:`, csUpsertErr.message)
+          }
+
           const convPayload = {
             project_id: csLine.project_id,
             phone: data.phone,
@@ -258,7 +271,8 @@ export async function notifyCapta(lineId, event, data) {
           }
           // Save pushName as contact name (update on every message — name can change)
           if (data.pushName) upsertData.name = data.pushName
-          await supabase.from('contacts').upsert(upsertData, { onConflict: 'project_id,phone' })
+          const { error: msgContactErr } = await supabase.from('contacts').upsert(upsertData, { onConflict: 'project_id,phone' })
+          if (msgContactErr) console.error(`[notify] contact upsert error (message):`, msgContactErr.message)
         }
         break
       }
