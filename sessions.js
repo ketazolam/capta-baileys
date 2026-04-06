@@ -69,13 +69,6 @@ export function isActiveTime() {
   return hour >= 8 && hour < 23
 }
 
-// --- Cleanup recentContacts every hour (prevent memory growth) ---
-setInterval(() => {
-  const now = Date.now()
-  for (const [key, ts] of recentContacts) {
-    if (now - ts > TWENTY_FOUR_HOURS) recentContacts.delete(key)
-  }
-}, 60 * 60 * 1000)
 
 export const sessionManager = {
   count: () => sessions.size,
