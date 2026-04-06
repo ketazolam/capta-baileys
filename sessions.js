@@ -554,6 +554,20 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
   const isNewContact = Date.now() - lastNotified > TWENTY_FOUR_HOURS
   recentContacts.set(contactKey, Date.now())
 
+  // Direct contact upsert — Railway → Supabase for ALL message types
+  // Avoids the fragile HTTP → Vercel chain (cold starts, timeouts) that was losing contacts
+  const sessionData = sessions.get(lineId)
+  if (sessionData && !sessionData._projectId) {
+    const { data: ld } = await supabase.from('lines').select('project_id').eq('id', lineId).single()
+    sessionData._projectId = ld?.project_id || null
+  }
+  if (sessionData?._projectId) {
+    const upsertData = { project_id: sessionData._projectId, phone, last_seen_at: new Date().toISOString() }
+    if (pushName) upsertData.name = pushName
+    const { error: upsertErr } = await supabase.from('contacts').upsert(upsertData, { onConflict: 'project_id,phone' })
+    if (upsertErr) console.error(`[${lineId}] Contact upsert error:`, upsertErr.message)
+  }
+
   // --- Mark message as read with human-like patterns ---
   // Not every message gets read immediately — 15% are "ignored" (read much later or never)
   const readChance = Math.random()
