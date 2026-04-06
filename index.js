@@ -63,8 +63,9 @@ app.get('/proxy-check', async (req, res) => {
   }
 })
 
-// Auth middleware for /lines routes
+// Auth middleware for /lines routes (QR page is public — UUID acts as token)
 app.use('/lines', (req, res, next) => {
+  if (req.path.endsWith('/qr-page') && req.method === 'GET') return next()
   const secret = process.env.INTERNAL_SECRET
   if (secret && req.headers['x-internal-secret'] !== secret) {
     return res.status(401).json({ error: 'Unauthorized' })
