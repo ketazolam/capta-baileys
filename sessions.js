@@ -76,8 +76,9 @@ export const sessionManager = {
   getAll: () => [...sessions.entries()].map(([id, s]) => {
     const connectedMs = s.connectedAt ? Date.now() - s.connectedAt : null
     const lastMsgMs = s.lastMessageAt ? Date.now() - s.lastMessageAt : null
-    const neverReceived = s.status === 'connected' && !s.lastMessageAt && connectedMs > 2 * 60 * 60 * 1000
-    const longSilence = s.status === 'connected' && lastMsgMs !== null && lastMsgMs > 2 * 60 * 60 * 1000
+    const zombieThresholdMs = isActiveTime() ? 2 * 60 * 60 * 1000 : 5 * 60 * 60 * 1000
+    const neverReceived = s.status === 'connected' && !s.lastMessageAt && connectedMs > zombieThresholdMs
+    const longSilence = s.status === 'connected' && lastMsgMs !== null && lastMsgMs > zombieThresholdMs
     return {
       lineId: id,
       status: s.status,
@@ -368,9 +369,13 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
         if (!sessions.has(lineId)) { clearInterval(sessionData._zombieTimer); sessionData._zombieTimer = null; return }
         const connectedMs = Date.now() - (sessionData.connectedAt || Date.now())
         const lastMsgMs = sessionData.lastMessageAt ? Date.now() - sessionData.lastMessageAt : connectedMs
-        // Zombie if: connected >2h with no message ever, OR last message >2h ago
-        const neverReceived = !sessionData.lastMessageAt && connectedMs > 2 * 60 * 60 * 1000
-        const longSilence = sessionData.lastMessageAt && lastMsgMs > 2 * 60 * 60 * 1000
+        // Use a longer threshold at night to avoid false positives during low-traffic hours.
+        // During active hours (8-23): 2h threshold catches genuine zombies quickly.
+        // During night (23-8): 5h threshold avoids reconnects just because no one messaged at 1 AM.
+        // Genuine zombies at night are still caught — just with a ~5h delay instead of 2h.
+        const zombieThresholdMs = isActiveTime() ? 2 * 60 * 60 * 1000 : 5 * 60 * 60 * 1000
+        const neverReceived = !sessionData.lastMessageAt && connectedMs > zombieThresholdMs
+        const longSilence = sessionData.lastMessageAt && lastMsgMs > zombieThresholdMs
         if (neverReceived || longSilence) {
           const reason = neverReceived
             ? `conectado hace ${Math.round(connectedMs / 60000)}min sin recibir ningún mensaje`
