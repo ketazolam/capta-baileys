@@ -77,7 +77,7 @@ export const sessionManager = {
     const connectedMs = s.connectedAt ? Date.now() - s.connectedAt : null
     const lastMsgMs = s.lastMessageAt ? Date.now() - s.lastMessageAt : null
     const neverReceived = s.status === 'connected' && !s.lastMessageAt && connectedMs > 2 * 60 * 60 * 1000
-    const longSilence = s.status === 'connected' && lastMsgMs !== null && lastMsgMs > 4 * 60 * 60 * 1000
+    const longSilence = s.status === 'connected' && lastMsgMs !== null && lastMsgMs > 2 * 60 * 60 * 1000
     return {
       lineId: id,
       status: s.status,

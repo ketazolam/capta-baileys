@@ -1,8 +1,8 @@
 import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
-import { sessionManager } from './sessions.js'
-import { processRetryQueue } from './notify.js'
+import { sessionManager, isActiveTime } from './sessions.js'
+import { processRetryQueue, sendTelegramAlert } from './notify.js'
 import linesRouter from './routes/lines.js'
 
 const app = express()
@@ -27,6 +27,35 @@ setInterval(async () => {
     await processRetryQueue()
   } catch {}
 }, 5 * 60 * 1000)
+
+// --- Global watchdog: defense-in-depth against zombies ---
+// Runs every 20min independently of per-session timers.
+// Catches cases where the per-session zombie timer was cleared and never restarted.
+setInterval(async () => {
+  try {
+    const sessions = sessionManager.getAll()
+    for (const s of sessions) {
+      if (s.status !== 'connected') continue
+      if (!s.zombieSuspected) continue
+      const connectedMs = s.connectedAt ? Date.now() - s.connectedAt : null
+      const lastMsgMs = s.lastMessageAt ? Date.now() - s.lastMessageAt : connectedMs
+      const reason = s.lastMessageAt
+        ? `watchdog: último mensaje hace ${Math.round(lastMsgMs / 60000)}min`
+        : `watchdog: conectado hace ${Math.round((connectedMs || 0) / 60000)}min sin mensajes`
+      console.error(`[index] 🧟 GLOBAL WATCHDOG forzando reconexión: ${s.lineId.slice(0, 8)} — ${reason}`)
+      if (isActiveTime()) {
+        await sendTelegramAlert(`🧟 <b>Watchdog reconectando línea</b>\n📱 ${s.lineId.slice(0, 8)}\n${reason}`)
+      }
+      // Close socket → triggers normal reconnect flow in sessions.js
+      const session = sessionManager.get(s.lineId)
+      if (session?.socket) {
+        try { session.socket.end() } catch {}
+      }
+    }
+  } catch (err) {
+    console.error('[index] Watchdog error:', err.message)
+  }
+}, 20 * 60 * 1000)
 
 app.get('/health', (_, res) => {
   const sessions = sessionManager.getAll()
