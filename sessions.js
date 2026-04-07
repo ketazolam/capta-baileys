@@ -473,7 +473,11 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
       // Track last real message received — used by zombie detection
       sessionData.lastMessageAt = Date.now()
 
-      await handleMessage(lineId, sock, msg, sessionData.proxyAgent)
+      try {
+        await handleMessage(lineId, sock, msg, sessionData.proxyAgent)
+      } catch (err) {
+        console.error(`[${lineId}] handleMessage error (msg skipped):`, err.message)
+      }
     }
   })
 
@@ -577,8 +581,15 @@ async function handleMessage(lineId, sock, msg, proxyAgent) {
   // Avoids the fragile HTTP → Vercel chain (cold starts, timeouts) that was losing contacts
   const sessionData = sessions.get(lineId)
   if (sessionData && !sessionData._projectId) {
-    const { data: ld } = await supabase.from('lines').select('project_id').eq('id', lineId).single()
-    sessionData._projectId = ld?.project_id || null
+    try {
+      const { data: ld } = await Promise.race([
+        supabase.from('lines').select('project_id').eq('id', lineId).single(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+      ])
+      sessionData._projectId = ld?.project_id || null
+    } catch (err) {
+      console.warn(`[${lineId}] Lazy project_id load failed: ${err.message}`)
+    }
   }
   if (sessionData?._projectId) {
     const upsertData = { project_id: sessionData._projectId, phone, last_seen_at: new Date().toISOString() }
