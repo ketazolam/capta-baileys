@@ -346,27 +346,27 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
 
       // --- Zombie detection: check every 30min if we're connected but receiving nothing ---
       // A zombie session has WS alive but WA stopped delivering messages (usually after 401 conflict)
+      // ALWAYS reconnect on zombie — even at night. Only suppress Telegram alert outside active hours.
       if (sessionData._zombieTimer) clearInterval(sessionData._zombieTimer)
       sessionData._zombieTimer = setInterval(async () => {
         if (sessionData.status !== 'connected') return
-        if (!isActiveTime()) return // Don't alert at night — silence is normal
         const connectedMs = Date.now() - (sessionData.connectedAt || Date.now())
         const lastMsgMs = sessionData.lastMessageAt ? Date.now() - sessionData.lastMessageAt : connectedMs
-        // Zombie if: connected >2h AND never received a message (or last message >4h ago)
-        // 2h threshold avoids false positives on low-traffic accounts (e.g. Sofycon quiet hours)
+        // Zombie if: connected >2h with no message ever, OR last message >2h ago
         const neverReceived = !sessionData.lastMessageAt && connectedMs > 2 * 60 * 60 * 1000
-        const longSilence = sessionData.lastMessageAt && lastMsgMs > 4 * 60 * 60 * 1000
+        const longSilence = sessionData.lastMessageAt && lastMsgMs > 2 * 60 * 60 * 1000
         if (neverReceived || longSilence) {
           const reason = neverReceived
             ? `conectado hace ${Math.round(connectedMs / 60000)}min sin recibir ningún mensaje`
             : `último mensaje hace ${Math.round(lastMsgMs / 3600000)}h`
           console.error(`[${lineId}] 🧟 ZOMBIE DETECTED — ${reason}. Forzando reconexión.`)
-          await notifyCapta(lineId, 'zombie', { reason })
+          // Only send Telegram alert during active hours — silence at night is expected but still reconnect
+          if (isActiveTime()) await notifyCapta(lineId, 'zombie', { reason })
           clearInterval(sessionData._zombieTimer)
           sessionData._zombieTimer = null
           try { sock.end() } catch {} // triggers normal reconnect flow
         }
-      }, 30 * 60 * 1000) // check every 30 minutes
+      }, 15 * 60 * 1000) // check every 15 minutes
     }
 
     if (connection === 'close') {
