@@ -40,7 +40,7 @@ function createProxyAgent(lineId, reconnectAttempt = 0) {
 }
 
 const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
-const MAX_MESSAGE_AGE_SECONDS = 300 // Ignore messages older than 5min (covers reconnect delays without losing leads)
+const MAX_MESSAGE_AGE_SECONDS = 600 // Ignore messages older than 10min — 5min was too aggressive, losing msgs during reconnects
 // Tracks contacts who messaged us (lineId:phone → timestamp)
 export const recentContacts = new Map()
 
@@ -238,14 +238,29 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
   }
   sessions.set(lineId, sessionData)
 
-  // Pre-load project_id async — avoids losing contacts/comprobantes that arrive before the lazy load resolves
-  supabase.from('lines').select('project_id').eq('id', lineId).single()
-    .then(({ data: ld, error: ldErr }) => {
-      if (ldErr) console.error(`[${lineId}] Failed to pre-load project_id:`, ldErr.message)
-      else if (ld?.project_id) { sessionData._projectId = ld.project_id; console.log(`[${lineId}] project_id pre-loaded: ${ld.project_id.slice(0, 8)}`) }
-      else console.warn(`[${lineId}] Line has no project_id in Supabase — contacts won't be created until this is fixed`)
-    })
-    .catch(err => console.error(`[${lineId}] project_id pre-load exception:`, err.message))
+  // Pre-load project_id with retry — critical for contact creation reliability
+  ;(async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const { data: ld, error: ldErr } = await Promise.race([
+          supabase.from('lines').select('project_id').eq('id', lineId).single(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+        ])
+        if (ldErr) throw ldErr
+        if (ld?.project_id) {
+          sessionData._projectId = ld.project_id
+          console.log(`[${lineId}] project_id pre-loaded: ${ld.project_id.slice(0, 8)}`)
+          return
+        }
+        console.warn(`[${lineId}] Line has no project_id in Supabase — contacts won't be created`)
+        return
+      } catch (err) {
+        console.warn(`[${lineId}] project_id preload attempt ${attempt + 1}/3 failed: ${err.message}`)
+        if (attempt < 2) await new Promise(r => setTimeout(r, 3000))
+      }
+    }
+    console.error(`[${lineId}] project_id preload failed after 3 attempts — contacts may be lost`)
+  })()
 
   if (proxyAgent) console.log(`[${lineId}] Using residential proxy (session: ${lineId.slice(0, 8)}${reconnectAttemptOverride > 0 ? `/r${reconnectAttemptOverride}` : ''})`)
 
@@ -350,6 +365,7 @@ async function startSession(lineId, reconnectAttemptOverride = 0, skipProxy = fa
       if (sessionData._zombieTimer) clearInterval(sessionData._zombieTimer)
       sessionData._zombieTimer = setInterval(async () => {
         if (sessionData.status !== 'connected') return
+        if (!sessions.has(lineId)) { clearInterval(sessionData._zombieTimer); sessionData._zombieTimer = null; return }
         const connectedMs = Date.now() - (sessionData.connectedAt || Date.now())
         const lastMsgMs = sessionData.lastMessageAt ? Date.now() - sessionData.lastMessageAt : connectedMs
         // Zombie if: connected >2h with no message ever, OR last message >2h ago

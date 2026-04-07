@@ -301,7 +301,13 @@ function loadRetryQueue() {
   return []
 }
 
+let _processingRetryQueue = false
 export async function processRetryQueue() {
+  if (_processingRetryQueue) return // Prevent concurrent runs
+  _processingRetryQueue = true
+  try { await _doProcessRetryQueue() } finally { _processingRetryQueue = false }
+}
+async function _doProcessRetryQueue() {
   const retries = loadRetryQueue()
   if (!retries.length) return
   const remaining = []

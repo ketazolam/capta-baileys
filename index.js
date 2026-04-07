@@ -5,6 +5,19 @@ import { sessionManager, isActiveTime } from './sessions.js'
 import { processRetryQueue, sendTelegramAlert } from './notify.js'
 import linesRouter from './routes/lines.js'
 
+// --- Global error handlers — prevent silent process crashes ---
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason)
+  console.error('[index] UNHANDLED REJECTION:', msg)
+  sendTelegramAlert(`🔴 <b>Error no manejado</b>\n${msg.slice(0, 300)}`).catch(() => {})
+})
+process.on('uncaughtException', (err) => {
+  console.error('[index] UNCAUGHT EXCEPTION:', err.message)
+  sendTelegramAlert(`🔴 <b>Excepción crítica — reiniciando</b>\n${err.message.slice(0, 300)}`).catch(() => {})
+  // Railway will restart the process automatically
+  process.exit(1)
+})
+
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
